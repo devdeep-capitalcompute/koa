@@ -193,6 +193,13 @@ jobs:
           PY
 
       - name: Sync docs context (auto document mode)
+        env:
+          # The repository's own default branch. verity-auto-docs.yml passes
+          # this when it regenerates the same file to check staleness; running
+          # the script bare here fell back to `main`, so on a repository whose
+          # default branch is anything else this step committed one value and
+          # the check demanded another, failing every pull request forever.
+          VERITY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: python scripts/sync_repo_docs.py
 
       - name: Upload suggested repo context artifacts
