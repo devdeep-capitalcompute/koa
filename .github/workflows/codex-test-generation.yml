@@ -1,0 +1,628 @@
+name: Verity Codex Test Generation
+# The dispatch id has to reach the run's title.
+#
+# Verity correlates a dispatch to its GitHub run by looking for this id in the
+# run's display title — that is the only exact link between the two, because a
+# workflow_dispatch response carries no run id. Without it the match falls back
+# to a time window, and when that cannot decide, the tracked record never learns
+# its run id at all: the webhook then writes the outcome to a second record and
+# the one being watched sits at "queued" forever.
+#
+# Seen live on the use-case run: it failed in seconds and the screen watching it
+# was still counting up a minute later.
+run-name: >-
+  Verity Codex Test Generation${{ inputs.dispatch_id != '' && format(' · {0}', inputs.dispatch_id) || '' }}
+
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Optional scope (e.g., frontend auth flows)"
+        required: false
+        default: ""
+      template_type:
+        description: "Test template: master (happy path), error (negative/failure), equivalence (boundary/partition), or all (every template, in one run)"
+        required: false
+        default: "master"
+      target_branch:
+        description: >-
+          Existing branch to commit the generated tests onto (optional). Set by Verity to the
+          branch of the pull request these tests are for, so the tests land in the same pull
+          request as the code they test. Left empty, the run cuts a branch of its own and
+          Verity opens a pull request for it, which is the right shape for a manual run against
+          the default branch.
+        required: false
+        default: ""
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+      enable_pr_creation:
+        description: "Explicitly allow this run to create/update a PR (true/false)"
+        required: true
+        default: "false"
+      dispatch_id:
+        description: "Verity-internal correlation id for this dispatch attempt (optional)"
+        required: false
+        default: ""
+      issue_number:
+        description: "Issue this test suite belongs to (optional)"
+        required: false
+        default: ""
+      verity_delivery_id:
+        description: "Verity delivery this run belongs to (optional). Echoed on every callback so one click's runs are recognisable as one attempt."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Keyed on the branch being written, not on the template, because the templates no
+# longer run as separate jobs racing to push to the same place. Two runs targeting
+# one branch would interleave commits and lose one of them; two runs targeting
+# different branches never conflict and should not wait for each other.
+concurrency:
+  group: verity-test-generation-${{ github.repository }}-${{ inputs.target_branch || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  generate_tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      # `target_branch` is the branch of the pull request these tests are for, so
+      # checking it out is what lets the generated tests see the code they are
+      # meant to test. Without it the run worked from the default branch, where
+      # the feature does not exist yet — so any test that actually asserted the
+      # new behaviour failed the verification step below and the whole run was
+      # thrown away, and what survived was by construction only tests that
+      # already passed without the change.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_branch || github.ref }}
+          fetch-depth: 0
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}" ]; then
+            echo "Missing required secret MULTRA_API_KEY or BLUESKY_API_KEY" >&2
+            exit 1
+          fi
+          if [ -z "${{ secrets.VERITY_PROJECT_TOKEN }}" ]; then
+            echo "Missing required secret VERITY_PROJECT_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Detect GitHub App write-token config
+        id: gh_write_cfg
+        env:
+          VERITY_GITHUB_APP_ID: ${{ secrets.VERITY_GITHUB_APP_ID }}
+          VERITY_GITHUB_APP_PRIVATE_KEY: ${{ secrets.VERITY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "$VERITY_GITHUB_APP_ID" ] && [ -n "$VERITY_GITHUB_APP_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve GitHub write token (optional GitHub App)
+        id: gh_write_token
+        if: ${{ steps.gh_write_cfg.outputs.enabled == 'true' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.VERITY_GITHUB_APP_ID }}
+          private-key: ${{ secrets.VERITY_GITHUB_APP_PRIVATE_KEY }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import os
+          from pathlib import Path
+          import yaml
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          commands = cfg.get("commands", {}) or {}
+          automation = cfg.get("automation", {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+
+          def norm_list(v):
+            if v is None: return []
+            if isinstance(v, list): return [str(x) for x in v if str(x).strip()]
+            if isinstance(v, str) and v.strip(): return [v.strip()]
+            return []
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+            f.write(f"project_id={project_override or str(verity.get('project_id','')).strip()}\n")
+            f.write(f"callback_url={callback_override or str(verity.get('callback_url','')).strip()}\n")
+            f.write("setup_cmds<<EOF\n" + "\n".join(norm_list(commands.get("setup"))) + "\nEOF\n")
+            f.write("test_cmds<<EOF\n" + "\n".join(norm_list(commands.get("test"))) + "\nEOF\n")
+            f.write("build_cmds<<EOF\n" + "\n".join(norm_list(commands.get("build"))) + "\nEOF\n")
+            f.write(f"automation_paused={'true' if automation.get('paused') else 'false'}\n")
+            f.write(f"auto_create_pr_enabled={'true' if automation.get('auto_create_pr') else 'false'}\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Notify Verity - started
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          VERITY_DELIVERY_ID: ${{ inputs.verity_delivery_id }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os, pathlib
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            # Hardcoded to match the filename Verity's dispatcher uses to key this run's
+            # tracking record — GITHUB_WORKFLOW is this workflow's human display name
+            # ("Verity Codex Test Generation"), which never matches and silently orphaned
+            # every dispatch-time record from its completion-time counterpart. `dispatch_id`
+            # remains the only field distinguishing one run of this workflow from another —
+            # a repository can have several in flight, one per pull request being tested.
+            "workflow": "codex-test-generation.yml",
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            # This run generates tests for a requirement someone clicked Start
+            # on, and used to say so nowhere. These two fields attach it to that
+            # requirement, which is what lets the product show the run at all.
+            #
+            # `issue_number` is deliberately not enough on its own: it finds
+            # the requirement, and a requirement's lock may only be released by
+            # the run building the change. See `mayRelease`.
+            "issue_number": os.environ.get("ISSUE_NUMBER") or None,
+            "verity_delivery_id": os.environ.get("VERITY_DELIVERY_ID") or None,
+            "dispatch_id": os.environ.get("DISPATCH_ID") or None
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Run setup commands
+        if: ${{ steps.cfg.outputs.setup_cmds != '' }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            bash -lc "$cmd"
+          done <<< "${{ steps.cfg.outputs.setup_cmds }}"
+
+      # ─── Install Node dependencies BEFORE anything that needs them ───
+      # Codex runs in a sandbox; without this the agent starts on a repo with a
+      # lockfile and an empty node_modules, and has to re-install for itself.
+      - name: Install Node dependencies
+        id: node_deps
+        run: |
+          set -uo pipefail
+          found=0
+          while IFS= read -r pkg; do
+            d=$(dirname "$pkg")
+            found=$((found+1))
+            if [ -d "$d/node_modules" ]; then
+              echo "$d - node_modules already present, skipping"
+              continue
+            fi
+            echo "::group::install dependencies in $d"
+            ok=1
+            if [ -f "$d/package-lock.json" ]; then
+              (cd "$d" && npm ci) || {
+                echo "::warning::npm ci failed in $d (lockfile out of sync?) - retrying with npm install"
+                (cd "$d" && npm install) || ok=0
+              }
+            else
+              (cd "$d" && npm install) || ok=0
+            fi
+            echo "::endgroup::"
+            if [ "$ok" != "1" ]; then
+              echo "::error::Dependency install failed in $d - later steps will run without node_modules"
+            fi
+          done < <(find . -maxdepth 3 -name package.json -not -path '*/node_modules/*')
+          if [ "$found" = "0" ]; then
+            echo "No Node package roots found (expected for non-Node repositories)"
+          fi
+
+      # One prompt file per template, written up front so the passes below stay
+      # identical apart from which file they read.
+      #
+      # `scope` arrives from a requirement's title and description — user text —
+      # and used to be interpolated straight into the shell by the runner. It
+      # travels as an environment variable now, where a backtick or a `$(` is
+      # just a character.
+      - name: Render prompts
+        id: prompts
+        env:
+          TEMPLATE_TYPE: ${{ inputs.template_type || 'master' }}
+          SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, pathlib
+
+          FOCUS = {
+            "master": """Focus on the happy path:
+          - The behaviour the change is meant to deliver, asserted end to end
+          - The states a user actually reaches, in the order they reach them
+          - Assertions on observable output, not on internal calls
+          Do NOT generate error-path or partition tests — those are separate passes.""",
+            "error": """Focus EXCLUSIVELY on negative and failure-path tests:
+          - Invalid inputs (wrong types, empty strings, nulls, oversized payloads)
+          - Missing required fields and parameters
+          - Unauthorized and forbidden access attempts
+          - API error responses (400, 401, 403, 404, 500)
+          - Boundary failures (max lengths, zero values, negative numbers)
+          - Concurrent/duplicate request handling
+          - Network and timeout error scenarios
+          Do NOT generate happy-path or success-case tests — only error and failure scenarios.""",
+            "equivalence": """Focus EXCLUSIVELY on equivalence class partitioning tests:
+          - Identify input domains and partition them into valid and invalid classes
+          - For each input field: test one representative value from each equivalence class
+          - Boundary value analysis: test at, just below, and just above boundaries
+          - Test combinations of valid/invalid classes across multiple inputs
+          - Label each test clearly with its partition (e.g., "valid-email-class", "invalid-negative-age-class")
+          - Cover: string lengths, numeric ranges, date ranges, enum values, boolean combinations
+          Do NOT generate general functional or error tests — only partition-based boundary tests.""",
+          }
+
+          requested = (os.environ.get("TEMPLATE_TYPE") or "master").strip().lower()
+          selected = list(FOCUS) if requested == "all" else [requested if requested in FOCUS else "master"]
+
+          base = pathlib.Path(".github/codex/prompts/test-generation.md").read_text(encoding="utf-8")
+          scope = (os.environ.get("SCOPE") or "").strip()
+
+          for template in selected:
+            parts = [base, "", f"## Test Template: {template}", "", FOCUS[template]]
+            if scope:
+              parts += ["", "## Scope", "", scope]
+            pathlib.Path(f"codex-prompt-{template}.md").write_text("\n".join(parts) + "\n", encoding="utf-8")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            for template in FOCUS:
+              handle.write(f"{template}={'true' if template in selected else 'false'}\n")
+            handle.write(f"selected={','.join(selected)}\n")
+          PY
+
+      # ─── Three passes, in one job, sharing one workspace ───
+      #
+      # These used to be three separate workflow runs dispatched in parallel.
+      # That cost three checkouts and three dependency installs for one
+      # requirement, produced three branches whose test files overlapped because
+      # no pass could see what the others had written, and — once each pushed
+      # branch got a pull request — three pull requests nobody had asked for.
+      #
+      # Run in sequence in one workspace, each pass sees the tests the previous
+      # one added, so "already covered" is a thing the agent can observe rather
+      # than guess at, and the result is one commit on one branch.
+
+      - name: Prepare Codex permission profile
+        shell: bash
+        run: |
+          # codex-action rewrites config.toml in CODEX_HOME to inject its proxy
+          # provider, so the profile is copied out of the checkout first.
+          mkdir -p "$RUNNER_TEMP/codex-home"
+          cp .github/codex/home/config.toml "$RUNNER_TEMP/codex-home/config.toml"
+          cp .github/codex/home/models.json "$RUNNER_TEMP/codex-home/models.json"
+
+      - name: Run Codex - master
+        id: codex_master
+        if: ${{ steps.prompts.outputs.master == 'true' }}
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 12
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          model: bluesky/auto
+          effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
+          prompt-file: codex-prompt-master.md
+          output-file: codex-output-master.md
+          sandbox: workspace-write
+
+      - name: Prepare Codex permission profile
+        shell: bash
+        run: |
+          # codex-action rewrites config.toml in CODEX_HOME to inject its proxy
+          # provider, so the profile is copied out of the checkout first.
+          mkdir -p "$RUNNER_TEMP/codex-home"
+          cp .github/codex/home/config.toml "$RUNNER_TEMP/codex-home/config.toml"
+          cp .github/codex/home/models.json "$RUNNER_TEMP/codex-home/models.json"
+
+      - name: Run Codex - error
+        id: codex_error
+        if: ${{ steps.prompts.outputs.error == 'true' }}
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 12
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          model: bluesky/auto
+          effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
+          prompt-file: codex-prompt-error.md
+          output-file: codex-output-error.md
+          sandbox: workspace-write
+
+      - name: Prepare Codex permission profile
+        shell: bash
+        run: |
+          # codex-action rewrites config.toml in CODEX_HOME to inject its proxy
+          # provider, so the profile is copied out of the checkout first.
+          mkdir -p "$RUNNER_TEMP/codex-home"
+          cp .github/codex/home/config.toml "$RUNNER_TEMP/codex-home/config.toml"
+          cp .github/codex/home/models.json "$RUNNER_TEMP/codex-home/models.json"
+
+      - name: Run Codex - equivalence
+        id: codex_equivalence
+        if: ${{ steps.prompts.outputs.equivalence == 'true' }}
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 12
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          model: bluesky/auto
+          effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
+          prompt-file: codex-prompt-equivalence.md
+          output-file: codex-output-equivalence.md
+          sandbox: workspace-write
+
+      - name: Sync docs context (auto document mode)
+        run: python scripts/sync_repo_docs.py
+
+      - name: Run tests/build
+        if: ${{ steps.cfg.outputs.test_cmds != '' }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            bash -lc "$cmd"
+          done <<< "${{ steps.cfg.outputs.test_cmds }}"
+          if [ -n "${{ steps.cfg.outputs.build_cmds }}" ]; then
+            while IFS= read -r cmd; do
+              [ -z "$cmd" ] && continue
+              bash -lc "$cmd"
+            done <<< "${{ steps.cfg.outputs.build_cmds }}"
+                    fi
+
+      - name: Clean transient artifacts before PR
+        run: |
+          # `git add -A` in the PR step sweeps up whatever is in the tree, and
+          # any Python run during the job can leave compiled bytecode behind.
+          # Without this a generated-test PR would also carry stray
+          # `__pycache__/*.pyc` files. Mirrors the same step in codex-dev-cycle.
+          find . -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find . -type f -name '*.pyc' -delete
+          rm -f codex-prompt-*.md codex-output-*.md
+
+      - name: Enforce PR creation gate
+        id: pr_gate
+        env:
+          INPUT_ENABLE_PR_CREATION: ${{ inputs.enable_pr_creation }}
+          CONFIG_AUTOMATION_PAUSED: ${{ steps.cfg.outputs.automation_paused }}
+          CONFIG_AUTO_CREATE_PR: ${{ steps.cfg.outputs.auto_create_pr_enabled }}
+          VAR_ENABLE_AUTO_PR: ${{ vars.VERITY_ENABLE_AUTO_PR }}
+        run: |
+          normalize() {
+            val="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+            if [ "$val" = "1" ] || [ "$val" = "true" ] || [ "$val" = "yes" ] || [ "$val" = "on" ]; then
+              echo "true"
+            else
+              echo "false"
+            fi
+          }
+
+          if [ "$(normalize "$CONFIG_AUTOMATION_PAUSED")" = "true" ]; then
+            echo "PR creation blocked: automation.paused is true in .verity/config.yml." >&2
+            exit 1
+          fi
+
+          manual_enabled="$(normalize "$INPUT_ENABLE_PR_CREATION")"
+          config_enabled="$(normalize "$CONFIG_AUTO_CREATE_PR")"
+          var_enabled="$(normalize "$VAR_ENABLE_AUTO_PR")"
+
+          if [ "$manual_enabled" != "true" ] && { [ "$config_enabled" != "true" ] || [ "$var_enabled" != "true" ]; }; then
+            # Not opted in to opening a PR. That is a mode, not a failure: the
+            # run has already done (or is about to do) the actual work, and
+            # failing here threw all of it away — and left the linked story
+            # locked on "Implementation started" with nothing to release it.
+            # Downstream PR steps check `allowed`; everything else proceeds.
+            echo "PR creation not enabled: set workflow input enable_pr_creation=true for a manual run, or automation.auto_create_pr=true plus repo variable VERITY_ENABLE_AUTO_PR=true for automated runs. Continuing without opening a PR." >&2
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=pr-creation-not-enabled" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "allowed=true" >> "$GITHUB_OUTPUT"
+
+      # Where the generated tests are going to land.
+      #
+      # With `target_branch` set they go onto the branch of the pull request
+      # they were written for, so the tests and the code they test are one
+      # change, reviewed once and merged once. That is the whole point of
+      # dispatching this run after the pull request exists rather than beside it.
+      #
+      # Without it, the old shape: a branch of this run's own, which Verity opens
+      # a pull request for. That is still the right answer for a manual run
+      # against the default branch, where there is no pull request to join.
+      - name: Resolve target branch
+        id: pr_branch
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          OWN_BRANCH: verity/codex-test-generation-${{ inputs.template_type || 'master' }}-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TARGET_BRANCH" ]; then
+            echo "name=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+            echo "existing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=$OWN_BRANCH" >> "$GITHUB_OUTPUT"
+            echo "existing=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Push only — this run never asks GitHub for a pull request.
+      #
+      # Opening one from here needs "Allow GitHub Actions to create and approve
+      # pull requests", which is off by default and which Verity can neither
+      # read nor change. Every run in a repository that had not ticked it died
+      # right here, after the tests were already written and paid for.
+      #
+      # Pushing needs only `contents: write`, which the workflow always has. The
+      # branch goes up, `Notify Verity - completed` reports it as `pr_branch`,
+      # and Verity resolves the pull request from its installation token, which
+      # is not subject to that setting: an existing branch resolves to the pull
+      # request already open for it, a new one gets a pull request opened. So the
+      # run stays green, the setting is off the critical path, and — because an
+      # App-opened PR triggers `pull_request` workflows where a `GITHUB_TOKEN`-
+      # opened one does not — `codex-pr-review` and the guardrails actually run
+      # on the result.
+      - name: Push tests
+        id: push_branch
+        if: ${{ steps.pr_gate.outputs.allowed == 'true' }}
+        env:
+          BRANCH: ${{ steps.pr_branch.outputs.name }}
+          ONTO_EXISTING: ${{ steps.pr_branch.outputs.existing }}
+          COMMIT_MESSAGE: "test(verity): add/update tests (${{ steps.prompts.outputs.selected }})"
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Codex produced no changes; nothing to push."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "$ONTO_EXISTING" != "true" ]; then
+            git checkout -b "$BRANCH"
+          fi
+          git add -A
+          # `git status` above can report changes that stage to nothing (mode
+          # bits, ignored paths). Committing then would abort the run on a
+          # non-failure.
+          if git diff --cached --quiet; then
+            echo "Nothing staged after add; nothing to push."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "$COMMIT_MESSAGE"
+
+          if [ "$ONTO_EXISTING" = "true" ]; then
+            # Someone else's branch. `--force` here would discard whatever the
+            # dev cycle, a reviewer or an auto-fix run pushed while these tests
+            # were being written — on the very pull request this is trying to
+            # help. Rebase onto whatever is there now and retry; give up rather
+            # than resolve a conflict blind.
+            pushed=false
+            for attempt in 1 2 3; do
+              if git push origin "HEAD:$BRANCH"; then
+                pushed=true
+                break
+              fi
+              echo "Push rejected (attempt $attempt); rebasing onto origin/$BRANCH"
+              git fetch origin "$BRANCH"
+              if ! git rebase "origin/$BRANCH"; then
+                git rebase --abort || true
+                echo "::error::Generated tests conflict with $BRANCH and were not pushed."
+                echo "pushed=false" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+            done
+            if [ "$pushed" != "true" ]; then
+              echo "::error::Could not push generated tests to $BRANCH after 3 attempts."
+              echo "pushed=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          else
+            # `--force` is safe rather than sloppy here: the branch name carries
+            # this run's id, so nothing else writes to it. It exists only to let a
+            # re-run of the same run overwrite its own earlier push.
+            git push --force origin "$BRANCH"
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Verity - completed
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          JOB_STATUS: ${{ job.status }}
+          # Only set once the branch is actually on the remote. Reporting it
+          # otherwise would have Verity try to open a PR from a ref that does
+          # not exist.
+          PR_BRANCH: ${{ steps.push_branch.outputs.pushed == 'true' && steps.pr_branch.outputs.name || '' }}
+          PR_TITLE: "Verity: test generation (${{ steps.prompts.outputs.selected }})"
+          PR_LABELS: "verity:agent,verity:tests"
+          # Only read when Verity has to open a pull request for this run — i.e.
+          # when it cut a branch of its own. A run that committed onto an
+          # existing pull request must not restate that pull request's title or
+          # relabel it; `ensureDevCyclePullRequest` returns the open one
+          # untouched, and these are ignored on that path.
+          PR_IS_NEW: ${{ steps.pr_branch.outputs.existing != 'true' }}
+          # All three passes, in the order they ran. One of them producing
+          # nothing is ordinary; losing the other two's account of what they did
+          # because they shared a step id was not.
+          CODEX_FINAL_MESSAGE: |
+            ${{ steps.codex_master.outputs.final-message }}
+            ${{ steps.codex_error.outputs.final-message }}
+            ${{ steps.codex_equivalence.outputs.final-message }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          VERITY_DELIVERY_ID: ${{ inputs.verity_delivery_id }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os, pathlib
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            # See the "started" callback above for why this is a literal, not GITHUB_WORKFLOW.
+            "workflow": "codex-test-generation.yml",
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": os.environ.get("JOB_STATUS"),
+            # This run pushes a branch and stops. `pr_branch` is the handoff:
+            # Verity opens the pull request from its installation token, so
+            # there is no `pr_number` to report from here.
+            "pr_branch": os.environ.get("PR_BRANCH") or None,
+            "pr_title": os.environ.get("PR_TITLE") or None,
+            "pr_labels": os.environ.get("PR_LABELS") or None,
+            "codex_final_message": (os.environ.get("CODEX_FINAL_MESSAGE") or "")[:20000],
+            # This run generates tests for a requirement someone clicked Start
+            # on, and used to say so nowhere. These two fields attach it to that
+            # requirement, which is what lets the product show the run at all.
+            #
+            # `issue_number` is deliberately not enough on its own: it finds
+            # the requirement, and a requirement's lock may only be released by
+            # the run building the change. See `mayRelease`.
+            "issue_number": os.environ.get("ISSUE_NUMBER") or None,
+            "verity_delivery_id": os.environ.get("VERITY_DELIVERY_ID") or None,
+            "dispatch_id": os.environ.get("DISPATCH_ID") or None
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true

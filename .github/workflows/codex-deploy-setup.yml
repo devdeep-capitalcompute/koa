@@ -1,0 +1,284 @@
+name: Verity Deploy Setup
+# The dispatch id has to reach the run's title.
+#
+# Verity correlates a dispatch to its GitHub run by looking for this id in the
+# run's display title — that is the only exact link between the two, because a
+# workflow_dispatch response carries no run id. Without it the match falls back
+# to a time window, and when that cannot decide, the tracked record never learns
+# its run id at all: the webhook then writes the outcome to a second record and
+# the one being watched sits at "queued" forever.
+#
+# Seen live on the use-case run: it failed in seconds and the screen watching it
+# was still counting up a minute later.
+run-name: >-
+  Verity Deploy Setup${{ inputs.dispatch_id != '' && format(' · {0}', inputs.dispatch_id) || '' }}
+
+
+# The AI-authored half of "every product deploys differently" (see
+# `deployTargetDetector.ts`'s header for the deterministic half that runs
+# first, for free, with no AI at all). Only dispatched when that detection
+# could not confidently propose a `commands.deploy` — a user clicked "Let
+# Verity draft it" in the dashboard.
+#
+# This run never deploys anything and is never given cloud credentials to do
+# so. It reads the repository, drafts `commands.deploy` (and a
+# `scripts/verity-deploy.sh` if the deploy needs more than a few commands)
+# into `.verity/config.yml`, and stops at a pushed branch — same rescue
+# pattern as `codex-test-generation.yml`: Verity's own installation token
+# opens the PR from `pr_branch` in the completion callback, because a
+# GITHUB_TOKEN-opened PR needs "Allow GitHub Actions to create and approve
+# pull requests" turned on, which is off by default and unreadable/unsettable
+# by Verity. See `.github/codex/prompts/deploy-setup.md` for what Codex is
+# told to do and, just as importantly, told never to do.
+#
+# Every subsequent deploy replays the committed script deterministically —
+# nothing here runs again once the PR merges.
+
+on:
+  workflow_dispatch:
+    inputs:
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+      enable_pr_creation:
+        description: "Explicitly allow this run to open a PR (true/false) — always sent true by Verity, since this workflow only ever dispatches from an explicit 'Let Verity draft it' click"
+        required: true
+        default: "false"
+      dispatch_id:
+        description: "Verity-internal correlation id for this dispatch attempt (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: verity-deploy-setup-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  draft_deploy_script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}" ]; then
+            echo "Missing required secret MULTRA_API_KEY or BLUESKY_API_KEY" >&2
+            exit 1
+          fi
+          if [ -z "${{ secrets.VERITY_PROJECT_TOKEN }}" ]; then
+            echo "Missing required secret VERITY_PROJECT_TOKEN" >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          cfg = yaml.safe_load(Path('.verity/config.yml').read_text()) or {}
+          verity = cfg.get('verity', {}) or {}
+          automation = cfg.get('automation', {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out, 'a', encoding='utf-8') as f:
+            f.write(f"project_id={project_override or str(verity.get('project_id', '')).strip()}\n")
+            f.write(f"callback_url={callback_override or str(verity.get('callback_url', '')).strip()}\n")
+            f.write(f"automation_paused={'true' if automation.get('paused') else 'false'}\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Notify Verity - started
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+        run: |
+          case "$VERITY_CALLBACK_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "Skipping callback: callback URL not configured"
+              exit 0
+              ;;
+          esac
+          python - <<'PY' | curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @- || true
+          import json, os
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": "codex-deploy-setup.yml",
+            "dispatch_id": os.environ.get("DISPATCH_ID") or None,
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+          }
+          print(json.dumps(payload))
+          PY
+
+      - name: Prepare Codex permission profile
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/codex-home"
+          cp .github/codex/home/config.toml "$RUNNER_TEMP/codex-home/config.toml"
+          cp .github/codex/home/models.json "$RUNNER_TEMP/codex-home/models.json"
+
+      - name: Run Codex
+        id: run_codex
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 15
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          model: bluesky/auto
+          effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
+          prompt-file: .github/codex/prompts/deploy-setup.md
+          output-file: codex-output.md
+          sandbox: workspace-write
+
+      # No config/var auto-path (unlike codex-test-generation's pr_gate) —
+      # this workflow is only ever dispatched from an explicit "Let Verity
+      # draft it" click, never on a schedule or a merge, so `enable_pr_creation`
+      # always carries the click's intent. `automation.paused` still hard-stops
+      # it: a full pause means no PRs of any kind.
+      - name: Enforce PR creation gate
+        id: pr_gate
+        env:
+          INPUT_ENABLE_PR_CREATION: ${{ inputs.enable_pr_creation }}
+          CONFIG_AUTOMATION_PAUSED: ${{ steps.cfg.outputs.automation_paused }}
+        run: |
+          normalize() {
+            val="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+            if [ "$val" = "1" ] || [ "$val" = "true" ] || [ "$val" = "yes" ] || [ "$val" = "on" ]; then
+              echo "true"
+            else
+              echo "false"
+            fi
+          }
+
+          if [ "$(normalize "$CONFIG_AUTOMATION_PAUSED")" = "true" ]; then
+            echo "PR creation blocked: automation.paused is true in .verity/config.yml." >&2
+            exit 1
+          fi
+
+          if [ "$(normalize "$INPUT_ENABLE_PR_CREATION")" != "true" ]; then
+            echo "PR creation not enabled: set workflow input enable_pr_creation=true. Continuing without opening a PR." >&2
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "allowed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve PR branch name
+        id: pr_branch
+        env:
+          BRANCH: verity/deploy-setup-${{ github.run_id }}
+        run: echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      # Push only — same reason as codex-test-generation.yml: opening the PR
+      # from here needs "Allow GitHub Actions to create and approve pull
+      # requests", off by default and unreadable/unsettable by Verity. Verity
+      # opens it from `pr_branch` on the completed callback, via its
+      # installation token instead.
+      - name: Push branch for Verity to open a PR from
+        id: push_branch
+        if: ${{ steps.pr_gate.outputs.allowed == 'true' }}
+        env:
+          BRANCH: ${{ steps.pr_branch.outputs.name }}
+          COMMIT_MESSAGE: "chore(verity): draft deploy setup"
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Codex produced no changes; nothing to push."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing staged after add; nothing to push."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "$COMMIT_MESSAGE"
+          git push --force origin "$BRANCH"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Verity - completed
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          JOB_STATUS: ${{ job.status }}
+          PR_BRANCH: ${{ steps.push_branch.outputs.pushed == 'true' && steps.pr_branch.outputs.name || '' }}
+          PR_TITLE: "Verity: draft deploy setup"
+          PR_LABELS: "verity:agent,verity:deploy-setup"
+          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+        run: |
+          case "$VERITY_CALLBACK_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "Skipping callback: callback URL not configured"
+              exit 0
+              ;;
+          esac
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "deploy_setup_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": "codex-deploy-setup.yml",
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": os.environ.get("JOB_STATUS"),
+            # Never set `auto_merge` — unlike the grounding-docs diff
+            # elsewhere, a deploy script is exactly the kind of AI-generated
+            # content ADR 0002 says must not land unreviewed: it will run
+            # with production credentials.
+            "pr_branch": os.environ.get("PR_BRANCH") or None,
+            "pr_title": os.environ.get("PR_TITLE") or None,
+            "pr_labels": os.environ.get("PR_LABELS") or None,
+            "codex_final_message": (os.environ.get("CODEX_FINAL_MESSAGE") or "")[:20000],
+            "dispatch_id": os.environ.get("DISPATCH_ID") or None,
+          }
+          print(json.dumps(payload))
+          PY
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true

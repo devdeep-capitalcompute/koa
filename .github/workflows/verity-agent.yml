@@ -1,0 +1,922 @@
+name: Verity Agent
+
+# The thin runner.
+#
+# Everything this file used to decide now lives in Verity's backend as tested
+# TypeScript: which prompt to use, which command to run, whether to retry,
+# whether a failure was the environment's fault or the code's, whether to open a
+# PR, when to stop. This workflow asks what to do, does exactly that, and
+# reports the result.
+# See docs/adr/0005-thread-model-and-runner-protocol.md in the Verity repo.
+#
+# **Why it looks like a list of identical slots.** The backend drives a loop:
+# ask, do one thing, report, ask again. Command steps are drained inside
+# `verity_runner.py step`, which is why there are far fewer slots than steps. A
+# *model* step cannot be, because it runs through a composite action and GitHub
+# Actions has no way to invoke an action from inside a loop. So the workflow is
+# as many slots as the longest stage needs model calls, each identical, each
+# switching itself off once `VERITY_FINISHED` is set. Adding a stage that needs
+# more model calls means adding slots here — nothing else.
+#
+# The dev cycle is the longest, and its worst case is six model calls:
+# implement, the second implement turn when the first left the tree unchanged,
+# one repair each for tests, build and browser tests, and the pull-request
+# description. Eight slots so that worst case still has room.
+#
+# Running out is not silent any more. The verdict step at the end calls the
+# runner without `--write-prompt`, and a model step arriving there used to
+# print a line and return 0 — the workflow ended green with the job still
+# live, its heartbeat stopped, and the stall reaper settled it three minutes
+# later as "we lost contact with it". It now reports a terminal event saying
+# exactly what happened, so adding a stage that needs more calls than there
+# are slots fails with its own name on it.
+
+run-name: >-
+  Verity Agent · ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Verity job id"
+        required: true
+      job_token:
+        description: "Single-job token (240 minute lifetime, this job only)"
+        required: true
+      api_base_url:
+        description: "Verity API base URL"
+        required: true
+
+permissions:
+  # `contents: write` is what the dev cycle needs to push the branch it wrote.
+  # The pull request is opened afterwards by Verity with its own installation
+  # token, because a PR opened by GITHUB_TOKEN needs "Allow GitHub Actions to
+  # create and approve pull requests" — off by default in every organisation,
+  # and neither readable nor settable by Verity.
+  contents: write
+  actions: read
+
+concurrency:
+  group: verity-agent-${{ github.repository }}-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    # Six model slots at 40 minutes each, plus the command steps drained
+    # between them. The per-step cap is the one that bites in practice: a dev
+    # cycle's `implement` step on a large repository was being killed at 25
+    # minutes mid-edit, which loses the work *and* reports only "did not run to
+    # completion". This ceiling has to stay above 6 x 40 or it just moves the
+    # same cliff one level up, and the job token's lifetime has to match it —
+    # see DEFAULT_JOB_TOKEN_TTL_SECONDS in the Verity backend.
+    timeout-minutes: 240
+    # A fork's pull request must never reach a job that holds this repository's
+    # secrets. `verity-pr-auto-fix.yml` already gates on this; the same rule
+    # applies here, where the secret in question is the customer's model key.
+    if: ${{ github.event.repository.fork == false }}
+    env:
+      VERITY_API_BASE_URL: ${{ inputs.api_base_url }}
+      VERITY_JOB_ID: ${{ inputs.job_id }}
+      # Never echoed. GitHub masks it in logs, and no step prints it.
+      VERITY_JOB_TOKEN: ${{ inputs.job_token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          # Kept, so the dev cycle's `git push` works without a second token.
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Confirm the model key is present
+        # Fails here with a sentence rather than inside the model step with a
+        # provider error. Verity also refuses to dispatch without a key, so
+        # reaching this message means the repo secret was removed after the fact.
+        run: |
+          if [ -z "${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}" ]; then
+            echo "::error::This repository has no MULTRA_API_KEY secret, so the agent cannot call a model. Add your key in Verity project settings and re-run." >&2
+            exit 1
+          fi
+
+      - name: Install the Verity runner client
+        run: |
+          set -euo pipefail
+          # Each model slot seeds its own CODEX_HOME just before it runs — see
+          # the note on the first one. A single shared directory collected the
+          # action's provider block once per slot and broke on the second.
+          cp .github/verity/verity_runner.py "${RUNNER_TEMP}/verity_runner.py"
+          cp scripts/prepare_multra_repository_graph.py "${RUNNER_TEMP}/verity_graph_preflight.py"
+
+      - name: Prepare repository context without waiting
+        id: graph
+        env:
+          MULTRA_API_KEY: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          MULTRA_RESPONSES_API_ENDPOINT: ${{ vars.MULTRA_RESPONSES_API_ENDPOINT }}
+        run: python "${RUNNER_TEMP}/verity_graph_preflight.py" --prepare-job
+
+      - name: Claim this job
+        if: ${{ env.VERITY_FINISHED != 'true' }}
+        run: python "${RUNNER_TEMP}/verity_runner.py" claim
+
+      # Liveness while work runs. Verity's reaper settles a job after three
+      # minutes of silence, so a runner that dies mid-step becomes a visible,
+      # explained failure instead of a spinner that never resolves.
+      - name: Start heartbeats
+        if: ${{ env.VERITY_FINISHED != 'true' }}
+        run: |
+          nohup python "${RUNNER_TEMP}/verity_runner.py" heartbeat-loop \
+            > "${RUNNER_TEMP}/heartbeat.log" 2>&1 &
+          echo "$!" > "${RUNNER_TEMP}/heartbeat.pid"
+
+      # ---------------------------------------------------------------- slot 1
+      - name: "Step 1: ask Verity what to do"
+        id: s1
+        if: ${{ env.VERITY_FINISHED != 'true' }}
+        # Runs every command Verity asks for, then hands back here the moment a
+        # model step comes up. Most slots therefore cover several steps.
+        run: python "${RUNNER_TEMP}/verity_runner.py" step --write-prompt "${RUNNER_TEMP}/prompt-1.md"
+
+      # A CODEX_HOME per slot, seeded from the trusted config.
+      #
+      # The action appends its provider block to `config.toml`, so a shared
+      # directory collected one block per slot and the second model step died
+      # on `duplicate key model_provider`. It is also what makes spend
+      # attributable: the CLI writes its session rollout here, and one
+      # directory for six steps meant the usage parser read whichever rollout
+      # was largest rather than the step it was reporting on.
+      - name: "Step 1: prepare the model workspace"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s1.outputs.kind == 'model' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/codex-home-1"
+          cp .github/codex/home/config.toml "${RUNNER_TEMP}/codex-home-1/config.toml"
+          # The catalogue config.toml names. Without it Codex falls back to its
+          # bundled one, which offers an apply_patch tool Multra never delivers.
+          cp .github/codex/home/models.json "${RUNNER_TEMP}/codex-home-1/models.json"
+          # Stamped so the report step can tell a model that ran out of
+          # wall clock apart from one that fell over: GitHub cancels a
+          # timed-out step without telling the workflow why.
+          date +%s > "${RUNNER_TEMP}/model-start-1"
+
+      - name: "Step 1: run the model"
+        id: m1
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s1.outputs.kind == 'model' }}
+        continue-on-error: true
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 40
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          # The model Verity named for this step, which is how the choice
+          # stays one decision in one place. `bluesky/auto` is the fallback
+          # for a Verity too old to name one — it is a router, and what it
+          # routes to has changed under us before, so it is not the default
+          # any run should land on silently.
+          model: ${{ steps.s1.outputs.model != '' && steps.s1.outputs.model || 'bluesky/auto' }}
+          prompt-file: ${{ runner.temp }}/prompt-1.md
+          output-file: ${{ steps.s1.outputs.output_file }}
+          # Verity decides read-only versus workspace-write, per step. The plan
+          # and review stages are read-only and cannot touch the checkout; only
+          # the dev cycle's own steps are allowed to write.
+          #
+          # Verity expresses filesystem authority only through this sandbox.
+          # `read-only` cannot modify the checkout; `workspace-write` is the
+          # only writable model mode.
+          sandbox: ${{ steps.s1.outputs.sandbox }}
+          # No legacy permission profile is layered on top of this sandbox.
+          # Pinning CODEX_HOME is what makes spend measurable: the Codex CLI
+          # writes its session rollout here, and the rollout is the only place
+          # token counts exist. The action itself exposes no usage output.
+        env:
+          # The request Codex actually sent, and the provider's answer to it.
+          #
+          # When a model step fails inside the provider, all the run can say
+          # today is Codex's own summary — "the provider rejected this request
+          # as invalid. Review the selected model, context size, tools, schema,
+          # and provider-specific parameters". That names five suspects and
+          # rules out none of them, and it is what a person is shown when their
+          # requirement comes back with nothing.
+          #
+          # This bundle records `InferenceStarted` with the request payload and
+          # `InferenceFailed` with the provider's `x-request-id`, which is the
+          # one identifier a provider can look a failure up by. It is written
+          # per slot, uploaded with the run's other evidence, and costs nothing
+          # on a run that succeeds.
+          CODEX_ROLLOUT_TRACE_ROOT: ${{ runner.temp }}/codex-trace-1
+
+      - name: "Step 1: report the model step"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s1.outputs.kind == 'model' }}
+        env:
+          STEP_ID: ${{ steps.s1.outputs.step_id }}
+          STEP_OUTCOME: ${{ steps.m1.outcome }}
+          OUTPUT_FILE: ${{ steps.s1.outputs.output_file }}
+          # This slot's own rollout, so the tokens reported are this step's.
+          CODEX_HOME: ${{ runner.temp }}/codex-home-1
+          # What was asked for, so the rollout scan can tell it apart from what
+          # answered. Without it the comparison is against an empty string and
+          # the router slug is reported back as the model that did the work,
+          # which is the one answer that says nothing.
+          CODEX_MODEL: ${{ steps.s1.outputs.model != '' && steps.s1.outputs.model || 'bluesky/auto' }}
+          # Both halves of "was this a timeout?", answered where the
+          # answer is knowable rather than guessed at read time.
+          MODEL_START_FILE: ${{ runner.temp }}/model-start-1
+          MODEL_TIMEOUT_MINUTES: "40"
+        run: python "${RUNNER_TEMP}/verity_runner.py" report-model-step
+
+      # ---------------------------------------------------------------- slot 2
+      - name: "Step 2: ask Verity what to do"
+        id: s2
+        if: ${{ env.VERITY_FINISHED != 'true' }}
+        # Runs every command Verity asks for, then hands back here the moment a
+        # model step comes up. Most slots therefore cover several steps.
+        run: python "${RUNNER_TEMP}/verity_runner.py" step --write-prompt "${RUNNER_TEMP}/prompt-2.md"
+
+      # A CODEX_HOME per slot, seeded from the trusted config.
+      #
+      # The action appends its provider block to `config.toml`, so a shared
+      # directory collected one block per slot and the second model step died
+      # on `duplicate key model_provider`. It is also what makes spend
+      # attributable: the CLI writes its session rollout here, and one
+      # directory for six steps meant the usage parser read whichever rollout
+      # was largest rather than the step it was reporting on.
+      - name: "Step 2: prepare the model workspace"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s2.outputs.kind == 'model' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/codex-home-2"
+          cp .github/codex/home/config.toml "${RUNNER_TEMP}/codex-home-2/config.toml"
+          # The catalogue config.toml names. Without it Codex falls back to its
+          # bundled one, which offers an apply_patch tool Multra never delivers.
+          cp .github/codex/home/models.json "${RUNNER_TEMP}/codex-home-2/models.json"
+          # Stamped so the report step can tell a model that ran out of
+          # wall clock apart from one that fell over: GitHub cancels a
+          # timed-out step without telling the workflow why.
+          date +%s > "${RUNNER_TEMP}/model-start-2"
+
+      - name: "Step 2: run the model"
+        id: m2
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s2.outputs.kind == 'model' }}
+        continue-on-error: true
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 40
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          # The model Verity named for this step, which is how the choice
+          # stays one decision in one place. `bluesky/auto` is the fallback
+          # for a Verity too old to name one — it is a router, and what it
+          # routes to has changed under us before, so it is not the default
+          # any run should land on silently.
+          model: ${{ steps.s2.outputs.model != '' && steps.s2.outputs.model || 'bluesky/auto' }}
+          prompt-file: ${{ runner.temp }}/prompt-2.md
+          output-file: ${{ steps.s2.outputs.output_file }}
+          # Verity decides read-only versus workspace-write, per step. The plan
+          # and review stages are read-only and cannot touch the checkout; only
+          # the dev cycle's own steps are allowed to write.
+          #
+          # Verity expresses filesystem authority only through this sandbox.
+          # `read-only` cannot modify the checkout; `workspace-write` is the
+          # only writable model mode.
+          sandbox: ${{ steps.s2.outputs.sandbox }}
+          # No legacy permission profile is layered on top of this sandbox.
+          # Pinning CODEX_HOME is what makes spend measurable: the Codex CLI
+          # writes its session rollout here, and the rollout is the only place
+          # token counts exist. The action itself exposes no usage output.
+        env:
+          # The request Codex actually sent, and the provider's answer to it.
+          #
+          # When a model step fails inside the provider, all the run can say
+          # today is Codex's own summary — "the provider rejected this request
+          # as invalid. Review the selected model, context size, tools, schema,
+          # and provider-specific parameters". That names five suspects and
+          # rules out none of them, and it is what a person is shown when their
+          # requirement comes back with nothing.
+          #
+          # This bundle records `InferenceStarted` with the request payload and
+          # `InferenceFailed` with the provider's `x-request-id`, which is the
+          # one identifier a provider can look a failure up by. It is written
+          # per slot, uploaded with the run's other evidence, and costs nothing
+          # on a run that succeeds.
+          CODEX_ROLLOUT_TRACE_ROOT: ${{ runner.temp }}/codex-trace-2
+
+      - name: "Step 2: report the model step"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s2.outputs.kind == 'model' }}
+        env:
+          STEP_ID: ${{ steps.s2.outputs.step_id }}
+          STEP_OUTCOME: ${{ steps.m2.outcome }}
+          OUTPUT_FILE: ${{ steps.s2.outputs.output_file }}
+          # This slot's own rollout, so the tokens reported are this step's.
+          CODEX_HOME: ${{ runner.temp }}/codex-home-2
+          # What was asked for, so the rollout scan can tell it apart from what
+          # answered. Without it the comparison is against an empty string and
+          # the router slug is reported back as the model that did the work,
+          # which is the one answer that says nothing.
+          CODEX_MODEL: ${{ steps.s2.outputs.model != '' && steps.s2.outputs.model || 'bluesky/auto' }}
+          # Both halves of "was this a timeout?", answered where the
+          # answer is knowable rather than guessed at read time.
+          MODEL_START_FILE: ${{ runner.temp }}/model-start-2
+          MODEL_TIMEOUT_MINUTES: "40"
+        run: python "${RUNNER_TEMP}/verity_runner.py" report-model-step
+
+      # ---------------------------------------------------------------- slot 3
+      - name: "Step 3: ask Verity what to do"
+        id: s3
+        if: ${{ env.VERITY_FINISHED != 'true' }}
+        # Runs every command Verity asks for, then hands back here the moment a
+        # model step comes up. Most slots therefore cover several steps.
+        run: python "${RUNNER_TEMP}/verity_runner.py" step --write-prompt "${RUNNER_TEMP}/prompt-3.md"
+
+      # A CODEX_HOME per slot, seeded from the trusted config.
+      #
+      # The action appends its provider block to `config.toml`, so a shared
+      # directory collected one block per slot and the second model step died
+      # on `duplicate key model_provider`. It is also what makes spend
+      # attributable: the CLI writes its session rollout here, and one
+      # directory for six steps meant the usage parser read whichever rollout
+      # was largest rather than the step it was reporting on.
+      - name: "Step 3: prepare the model workspace"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s3.outputs.kind == 'model' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/codex-home-3"
+          cp .github/codex/home/config.toml "${RUNNER_TEMP}/codex-home-3/config.toml"
+          # The catalogue config.toml names. Without it Codex falls back to its
+          # bundled one, which offers an apply_patch tool Multra never delivers.
+          cp .github/codex/home/models.json "${RUNNER_TEMP}/codex-home-3/models.json"
+          # Stamped so the report step can tell a model that ran out of
+          # wall clock apart from one that fell over: GitHub cancels a
+          # timed-out step without telling the workflow why.
+          date +%s > "${RUNNER_TEMP}/model-start-3"
+
+      - name: "Step 3: run the model"
+        id: m3
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s3.outputs.kind == 'model' }}
+        continue-on-error: true
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 40
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          # The model Verity named for this step, which is how the choice
+          # stays one decision in one place. `bluesky/auto` is the fallback
+          # for a Verity too old to name one — it is a router, and what it
+          # routes to has changed under us before, so it is not the default
+          # any run should land on silently.
+          model: ${{ steps.s3.outputs.model != '' && steps.s3.outputs.model || 'bluesky/auto' }}
+          prompt-file: ${{ runner.temp }}/prompt-3.md
+          output-file: ${{ steps.s3.outputs.output_file }}
+          # Verity decides read-only versus workspace-write, per step. The plan
+          # and review stages are read-only and cannot touch the checkout; only
+          # the dev cycle's own steps are allowed to write.
+          #
+          # Verity expresses filesystem authority only through this sandbox.
+          # `read-only` cannot modify the checkout; `workspace-write` is the
+          # only writable model mode.
+          sandbox: ${{ steps.s3.outputs.sandbox }}
+          # No legacy permission profile is layered on top of this sandbox.
+          # Pinning CODEX_HOME is what makes spend measurable: the Codex CLI
+          # writes its session rollout here, and the rollout is the only place
+          # token counts exist. The action itself exposes no usage output.
+        env:
+          # The request Codex actually sent, and the provider's answer to it.
+          #
+          # When a model step fails inside the provider, all the run can say
+          # today is Codex's own summary — "the provider rejected this request
+          # as invalid. Review the selected model, context size, tools, schema,
+          # and provider-specific parameters". That names five suspects and
+          # rules out none of them, and it is what a person is shown when their
+          # requirement comes back with nothing.
+          #
+          # This bundle records `InferenceStarted` with the request payload and
+          # `InferenceFailed` with the provider's `x-request-id`, which is the
+          # one identifier a provider can look a failure up by. It is written
+          # per slot, uploaded with the run's other evidence, and costs nothing
+          # on a run that succeeds.
+          CODEX_ROLLOUT_TRACE_ROOT: ${{ runner.temp }}/codex-trace-3
+
+      - name: "Step 3: report the model step"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s3.outputs.kind == 'model' }}
+        env:
+          STEP_ID: ${{ steps.s3.outputs.step_id }}
+          STEP_OUTCOME: ${{ steps.m3.outcome }}
+          OUTPUT_FILE: ${{ steps.s3.outputs.output_file }}
+          # This slot's own rollout, so the tokens reported are this step's.
+          CODEX_HOME: ${{ runner.temp }}/codex-home-3
+          # What was asked for, so the rollout scan can tell it apart from what
+          # answered. Without it the comparison is against an empty string and
+          # the router slug is reported back as the model that did the work,
+          # which is the one answer that says nothing.
+          CODEX_MODEL: ${{ steps.s3.outputs.model != '' && steps.s3.outputs.model || 'bluesky/auto' }}
+          # Both halves of "was this a timeout?", answered where the
+          # answer is knowable rather than guessed at read time.
+          MODEL_START_FILE: ${{ runner.temp }}/model-start-3
+          MODEL_TIMEOUT_MINUTES: "40"
+        run: python "${RUNNER_TEMP}/verity_runner.py" report-model-step
+
+      # ---------------------------------------------------------------- slot 4
+      - name: "Step 4: ask Verity what to do"
+        id: s4
+        if: ${{ env.VERITY_FINISHED != 'true' }}
+        # Runs every command Verity asks for, then hands back here the moment a
+        # model step comes up. Most slots therefore cover several steps.
+        run: python "${RUNNER_TEMP}/verity_runner.py" step --write-prompt "${RUNNER_TEMP}/prompt-4.md"
+
+      # A CODEX_HOME per slot, seeded from the trusted config.
+      #
+      # The action appends its provider block to `config.toml`, so a shared
+      # directory collected one block per slot and the second model step died
+      # on `duplicate key model_provider`. It is also what makes spend
+      # attributable: the CLI writes its session rollout here, and one
+      # directory for six steps meant the usage parser read whichever rollout
+      # was largest rather than the step it was reporting on.
+      - name: "Step 4: prepare the model workspace"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s4.outputs.kind == 'model' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/codex-home-4"
+          cp .github/codex/home/config.toml "${RUNNER_TEMP}/codex-home-4/config.toml"
+          # The catalogue config.toml names. Without it Codex falls back to its
+          # bundled one, which offers an apply_patch tool Multra never delivers.
+          cp .github/codex/home/models.json "${RUNNER_TEMP}/codex-home-4/models.json"
+          # Stamped so the report step can tell a model that ran out of
+          # wall clock apart from one that fell over: GitHub cancels a
+          # timed-out step without telling the workflow why.
+          date +%s > "${RUNNER_TEMP}/model-start-4"
+
+      - name: "Step 4: run the model"
+        id: m4
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s4.outputs.kind == 'model' }}
+        continue-on-error: true
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 40
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          # The model Verity named for this step, which is how the choice
+          # stays one decision in one place. `bluesky/auto` is the fallback
+          # for a Verity too old to name one — it is a router, and what it
+          # routes to has changed under us before, so it is not the default
+          # any run should land on silently.
+          model: ${{ steps.s4.outputs.model != '' && steps.s4.outputs.model || 'bluesky/auto' }}
+          prompt-file: ${{ runner.temp }}/prompt-4.md
+          output-file: ${{ steps.s4.outputs.output_file }}
+          # Verity decides read-only versus workspace-write, per step. The plan
+          # and review stages are read-only and cannot touch the checkout; only
+          # the dev cycle's own steps are allowed to write.
+          #
+          # Verity expresses filesystem authority only through this sandbox.
+          # `read-only` cannot modify the checkout; `workspace-write` is the
+          # only writable model mode.
+          sandbox: ${{ steps.s4.outputs.sandbox }}
+          # No legacy permission profile is layered on top of this sandbox.
+          # Pinning CODEX_HOME is what makes spend measurable: the Codex CLI
+          # writes its session rollout here, and the rollout is the only place
+          # token counts exist. The action itself exposes no usage output.
+        env:
+          # The request Codex actually sent, and the provider's answer to it.
+          #
+          # When a model step fails inside the provider, all the run can say
+          # today is Codex's own summary — "the provider rejected this request
+          # as invalid. Review the selected model, context size, tools, schema,
+          # and provider-specific parameters". That names five suspects and
+          # rules out none of them, and it is what a person is shown when their
+          # requirement comes back with nothing.
+          #
+          # This bundle records `InferenceStarted` with the request payload and
+          # `InferenceFailed` with the provider's `x-request-id`, which is the
+          # one identifier a provider can look a failure up by. It is written
+          # per slot, uploaded with the run's other evidence, and costs nothing
+          # on a run that succeeds.
+          CODEX_ROLLOUT_TRACE_ROOT: ${{ runner.temp }}/codex-trace-4
+
+      - name: "Step 4: report the model step"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s4.outputs.kind == 'model' }}
+        env:
+          STEP_ID: ${{ steps.s4.outputs.step_id }}
+          STEP_OUTCOME: ${{ steps.m4.outcome }}
+          OUTPUT_FILE: ${{ steps.s4.outputs.output_file }}
+          # This slot's own rollout, so the tokens reported are this step's.
+          CODEX_HOME: ${{ runner.temp }}/codex-home-4
+          # What was asked for, so the rollout scan can tell it apart from what
+          # answered. Without it the comparison is against an empty string and
+          # the router slug is reported back as the model that did the work,
+          # which is the one answer that says nothing.
+          CODEX_MODEL: ${{ steps.s4.outputs.model != '' && steps.s4.outputs.model || 'bluesky/auto' }}
+          # Both halves of "was this a timeout?", answered where the
+          # answer is knowable rather than guessed at read time.
+          MODEL_START_FILE: ${{ runner.temp }}/model-start-4
+          MODEL_TIMEOUT_MINUTES: "40"
+        run: python "${RUNNER_TEMP}/verity_runner.py" report-model-step
+
+      # ---------------------------------------------------------------- slot 5
+      - name: "Step 5: ask Verity what to do"
+        id: s5
+        if: ${{ env.VERITY_FINISHED != 'true' }}
+        # Runs every command Verity asks for, then hands back here the moment a
+        # model step comes up. Most slots therefore cover several steps.
+        run: python "${RUNNER_TEMP}/verity_runner.py" step --write-prompt "${RUNNER_TEMP}/prompt-5.md"
+
+      # A CODEX_HOME per slot, seeded from the trusted config.
+      #
+      # The action appends its provider block to `config.toml`, so a shared
+      # directory collected one block per slot and the second model step died
+      # on `duplicate key model_provider`. It is also what makes spend
+      # attributable: the CLI writes its session rollout here, and one
+      # directory for six steps meant the usage parser read whichever rollout
+      # was largest rather than the step it was reporting on.
+      - name: "Step 5: prepare the model workspace"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s5.outputs.kind == 'model' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/codex-home-5"
+          cp .github/codex/home/config.toml "${RUNNER_TEMP}/codex-home-5/config.toml"
+          # The catalogue config.toml names. Without it Codex falls back to its
+          # bundled one, which offers an apply_patch tool Multra never delivers.
+          cp .github/codex/home/models.json "${RUNNER_TEMP}/codex-home-5/models.json"
+          # Stamped so the report step can tell a model that ran out of
+          # wall clock apart from one that fell over: GitHub cancels a
+          # timed-out step without telling the workflow why.
+          date +%s > "${RUNNER_TEMP}/model-start-5"
+
+      - name: "Step 5: run the model"
+        id: m5
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s5.outputs.kind == 'model' }}
+        continue-on-error: true
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 40
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          # The model Verity named for this step, which is how the choice
+          # stays one decision in one place. `bluesky/auto` is the fallback
+          # for a Verity too old to name one — it is a router, and what it
+          # routes to has changed under us before, so it is not the default
+          # any run should land on silently.
+          model: ${{ steps.s5.outputs.model != '' && steps.s5.outputs.model || 'bluesky/auto' }}
+          prompt-file: ${{ runner.temp }}/prompt-5.md
+          output-file: ${{ steps.s5.outputs.output_file }}
+          # Verity decides read-only versus workspace-write, per step. The plan
+          # and review stages are read-only and cannot touch the checkout; only
+          # the dev cycle's own steps are allowed to write.
+          #
+          # Verity expresses filesystem authority only through this sandbox.
+          # `read-only` cannot modify the checkout; `workspace-write` is the
+          # only writable model mode.
+          sandbox: ${{ steps.s5.outputs.sandbox }}
+          # No legacy permission profile is layered on top of this sandbox.
+          # Pinning CODEX_HOME is what makes spend measurable: the Codex CLI
+          # writes its session rollout here, and the rollout is the only place
+          # token counts exist. The action itself exposes no usage output.
+        env:
+          # The request Codex actually sent, and the provider's answer to it.
+          #
+          # When a model step fails inside the provider, all the run can say
+          # today is Codex's own summary — "the provider rejected this request
+          # as invalid. Review the selected model, context size, tools, schema,
+          # and provider-specific parameters". That names five suspects and
+          # rules out none of them, and it is what a person is shown when their
+          # requirement comes back with nothing.
+          #
+          # This bundle records `InferenceStarted` with the request payload and
+          # `InferenceFailed` with the provider's `x-request-id`, which is the
+          # one identifier a provider can look a failure up by. It is written
+          # per slot, uploaded with the run's other evidence, and costs nothing
+          # on a run that succeeds.
+          CODEX_ROLLOUT_TRACE_ROOT: ${{ runner.temp }}/codex-trace-5
+
+      - name: "Step 5: report the model step"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s5.outputs.kind == 'model' }}
+        env:
+          STEP_ID: ${{ steps.s5.outputs.step_id }}
+          STEP_OUTCOME: ${{ steps.m5.outcome }}
+          OUTPUT_FILE: ${{ steps.s5.outputs.output_file }}
+          # This slot's own rollout, so the tokens reported are this step's.
+          CODEX_HOME: ${{ runner.temp }}/codex-home-5
+          # What was asked for, so the rollout scan can tell it apart from what
+          # answered. Without it the comparison is against an empty string and
+          # the router slug is reported back as the model that did the work,
+          # which is the one answer that says nothing.
+          CODEX_MODEL: ${{ steps.s5.outputs.model != '' && steps.s5.outputs.model || 'bluesky/auto' }}
+          # Both halves of "was this a timeout?", answered where the
+          # answer is knowable rather than guessed at read time.
+          MODEL_START_FILE: ${{ runner.temp }}/model-start-5
+          MODEL_TIMEOUT_MINUTES: "40"
+        run: python "${RUNNER_TEMP}/verity_runner.py" report-model-step
+
+      # ---------------------------------------------------------------- slot 6
+      - name: "Step 6: ask Verity what to do"
+        id: s6
+        if: ${{ env.VERITY_FINISHED != 'true' }}
+        # Runs every command Verity asks for, then hands back here the moment a
+        # model step comes up. Most slots therefore cover several steps.
+        run: python "${RUNNER_TEMP}/verity_runner.py" step --write-prompt "${RUNNER_TEMP}/prompt-6.md"
+
+      # A CODEX_HOME per slot, seeded from the trusted config.
+      #
+      # The action appends its provider block to `config.toml`, so a shared
+      # directory collected one block per slot and the second model step died
+      # on `duplicate key model_provider`. It is also what makes spend
+      # attributable: the CLI writes its session rollout here, and one
+      # directory for six steps meant the usage parser read whichever rollout
+      # was largest rather than the step it was reporting on.
+      - name: "Step 6: prepare the model workspace"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s6.outputs.kind == 'model' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/codex-home-6"
+          cp .github/codex/home/config.toml "${RUNNER_TEMP}/codex-home-6/config.toml"
+          # The catalogue config.toml names. Without it Codex falls back to its
+          # bundled one, which offers an apply_patch tool Multra never delivers.
+          cp .github/codex/home/models.json "${RUNNER_TEMP}/codex-home-6/models.json"
+          # Stamped so the report step can tell a model that ran out of
+          # wall clock apart from one that fell over: GitHub cancels a
+          # timed-out step without telling the workflow why.
+          date +%s > "${RUNNER_TEMP}/model-start-6"
+
+      - name: "Step 6: run the model"
+        id: m6
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s6.outputs.kind == 'model' }}
+        continue-on-error: true
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 40
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          # The model Verity named for this step, which is how the choice
+          # stays one decision in one place. `bluesky/auto` is the fallback
+          # for a Verity too old to name one — it is a router, and what it
+          # routes to has changed under us before, so it is not the default
+          # any run should land on silently.
+          model: ${{ steps.s6.outputs.model != '' && steps.s6.outputs.model || 'bluesky/auto' }}
+          prompt-file: ${{ runner.temp }}/prompt-6.md
+          output-file: ${{ steps.s6.outputs.output_file }}
+          # Verity decides read-only versus workspace-write, per step. The plan
+          # and review stages are read-only and cannot touch the checkout; only
+          # the dev cycle's own steps are allowed to write.
+          #
+          # Verity expresses filesystem authority only through this sandbox.
+          # `read-only` cannot modify the checkout; `workspace-write` is the
+          # only writable model mode.
+          sandbox: ${{ steps.s6.outputs.sandbox }}
+          # No legacy permission profile is layered on top of this sandbox.
+          # Pinning CODEX_HOME is what makes spend measurable: the Codex CLI
+          # writes its session rollout here, and the rollout is the only place
+          # token counts exist. The action itself exposes no usage output.
+        env:
+          # The request Codex actually sent, and the provider's answer to it.
+          #
+          # When a model step fails inside the provider, all the run can say
+          # today is Codex's own summary — "the provider rejected this request
+          # as invalid. Review the selected model, context size, tools, schema,
+          # and provider-specific parameters". That names five suspects and
+          # rules out none of them, and it is what a person is shown when their
+          # requirement comes back with nothing.
+          #
+          # This bundle records `InferenceStarted` with the request payload and
+          # `InferenceFailed` with the provider's `x-request-id`, which is the
+          # one identifier a provider can look a failure up by. It is written
+          # per slot, uploaded with the run's other evidence, and costs nothing
+          # on a run that succeeds.
+          CODEX_ROLLOUT_TRACE_ROOT: ${{ runner.temp }}/codex-trace-6
+
+      - name: "Step 6: report the model step"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s6.outputs.kind == 'model' }}
+        env:
+          STEP_ID: ${{ steps.s6.outputs.step_id }}
+          STEP_OUTCOME: ${{ steps.m6.outcome }}
+          OUTPUT_FILE: ${{ steps.s6.outputs.output_file }}
+          # This slot's own rollout, so the tokens reported are this step's.
+          CODEX_HOME: ${{ runner.temp }}/codex-home-6
+          # What was asked for, so the rollout scan can tell it apart from what
+          # answered. Without it the comparison is against an empty string and
+          # the router slug is reported back as the model that did the work,
+          # which is the one answer that says nothing.
+          CODEX_MODEL: ${{ steps.s6.outputs.model != '' && steps.s6.outputs.model || 'bluesky/auto' }}
+          # Both halves of "was this a timeout?", answered where the
+          # answer is knowable rather than guessed at read time.
+          MODEL_START_FILE: ${{ runner.temp }}/model-start-6
+          MODEL_TIMEOUT_MINUTES: "40"
+        run: python "${RUNNER_TEMP}/verity_runner.py" report-model-step
+
+      # ---------------------------------------------------------------- slot 7
+      - name: "Step 7: ask Verity what to do"
+        id: s7
+        if: ${{ env.VERITY_FINISHED != 'true' }}
+        # Runs every command Verity asks for, then hands back here the moment a
+        # model step comes up. Most slots therefore cover several steps.
+        run: python "${RUNNER_TEMP}/verity_runner.py" step --write-prompt "${RUNNER_TEMP}/prompt-7.md"
+
+      # A CODEX_HOME per slot, seeded from the trusted config.
+      #
+      # The action appends its provider block to `config.toml`, so a shared
+      # directory collected one block per slot and the second model step died
+      # on `duplicate key model_provider`. It is also what makes spend
+      # attributable: the CLI writes its session rollout here, and one
+      # directory for six steps meant the usage parser read whichever rollout
+      # was largest rather than the step it was reporting on.
+      - name: "Step 7: prepare the model workspace"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s7.outputs.kind == 'model' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/codex-home-7"
+          cp .github/codex/home/config.toml "${RUNNER_TEMP}/codex-home-7/config.toml"
+          # The catalogue config.toml names. Without it Codex falls back to its
+          # bundled one, which offers an apply_patch tool Multra never delivers.
+          cp .github/codex/home/models.json "${RUNNER_TEMP}/codex-home-7/models.json"
+          # Stamped so the report step can tell a model that ran out of
+          # wall clock apart from one that fell over: GitHub cancels a
+          # timed-out step without telling the workflow why.
+          date +%s > "${RUNNER_TEMP}/model-start-7"
+
+      - name: "Step 7: run the model"
+        id: m7
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s7.outputs.kind == 'model' }}
+        continue-on-error: true
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 40
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          # The model Verity named for this step, which is how the choice
+          # stays one decision in one place. `bluesky/auto` is the fallback
+          # for a Verity too old to name one — it is a router, and what it
+          # routes to has changed under us before, so it is not the default
+          # any run should land on silently.
+          model: ${{ steps.s7.outputs.model != '' && steps.s7.outputs.model || 'bluesky/auto' }}
+          prompt-file: ${{ runner.temp }}/prompt-7.md
+          output-file: ${{ steps.s7.outputs.output_file }}
+          # Verity decides read-only versus workspace-write, per step. The plan
+          # and review stages are read-only and cannot touch the checkout; only
+          # the dev cycle's own steps are allowed to write.
+          #
+          # Verity expresses filesystem authority only through this sandbox.
+          # `read-only` cannot modify the checkout; `workspace-write` is the
+          # only writable model mode.
+          sandbox: ${{ steps.s7.outputs.sandbox }}
+          # No legacy permission profile is layered on top of this sandbox.
+          # Pinning CODEX_HOME is what makes spend measurable: the Codex CLI
+          # writes its session rollout here, and the rollout is the only place
+          # token counts exist. The action itself exposes no usage output.
+        env:
+          # The request Codex actually sent, and the provider's answer to it.
+          #
+          # When a model step fails inside the provider, all the run can say
+          # today is Codex's own summary — "the provider rejected this request
+          # as invalid. Review the selected model, context size, tools, schema,
+          # and provider-specific parameters". That names five suspects and
+          # rules out none of them, and it is what a person is shown when their
+          # requirement comes back with nothing.
+          #
+          # This bundle records `InferenceStarted` with the request payload and
+          # `InferenceFailed` with the provider's `x-request-id`, which is the
+          # one identifier a provider can look a failure up by. It is written
+          # per slot, uploaded with the run's other evidence, and costs nothing
+          # on a run that succeeds.
+          CODEX_ROLLOUT_TRACE_ROOT: ${{ runner.temp }}/codex-trace-7
+
+      - name: "Step 7: report the model step"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s7.outputs.kind == 'model' }}
+        env:
+          STEP_ID: ${{ steps.s7.outputs.step_id }}
+          STEP_OUTCOME: ${{ steps.m7.outcome }}
+          OUTPUT_FILE: ${{ steps.s7.outputs.output_file }}
+          # This slot's own rollout, so the tokens reported are this step's.
+          CODEX_HOME: ${{ runner.temp }}/codex-home-7
+          # What was asked for, so the rollout scan can tell it apart from what
+          # answered. Without it the comparison is against an empty string and
+          # the router slug is reported back as the model that did the work,
+          # which is the one answer that says nothing.
+          CODEX_MODEL: ${{ steps.s7.outputs.model != '' && steps.s7.outputs.model || 'bluesky/auto' }}
+          # Both halves of "was this a timeout?", answered where the
+          # answer is knowable rather than guessed at read time.
+          MODEL_START_FILE: ${{ runner.temp }}/model-start-7
+          MODEL_TIMEOUT_MINUTES: "40"
+        run: python "${RUNNER_TEMP}/verity_runner.py" report-model-step
+
+      # ---------------------------------------------------------------- slot 8
+      - name: "Step 8: ask Verity what to do"
+        id: s8
+        if: ${{ env.VERITY_FINISHED != 'true' }}
+        # Runs every command Verity asks for, then hands back here the moment a
+        # model step comes up. Most slots therefore cover several steps.
+        run: python "${RUNNER_TEMP}/verity_runner.py" step --write-prompt "${RUNNER_TEMP}/prompt-8.md"
+
+      # A CODEX_HOME per slot, seeded from the trusted config.
+      #
+      # The action appends its provider block to `config.toml`, so a shared
+      # directory collected one block per slot and the second model step died
+      # on `duplicate key model_provider`. It is also what makes spend
+      # attributable: the CLI writes its session rollout here, and one
+      # directory for six steps meant the usage parser read whichever rollout
+      # was largest rather than the step it was reporting on.
+      - name: "Step 8: prepare the model workspace"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s8.outputs.kind == 'model' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/codex-home-8"
+          cp .github/codex/home/config.toml "${RUNNER_TEMP}/codex-home-8/config.toml"
+          # The catalogue config.toml names. Without it Codex falls back to its
+          # bundled one, which offers an apply_patch tool Multra never delivers.
+          cp .github/codex/home/models.json "${RUNNER_TEMP}/codex-home-8/models.json"
+          # Stamped so the report step can tell a model that ran out of
+          # wall clock apart from one that fell over: GitHub cancels a
+          # timed-out step without telling the workflow why.
+          date +%s > "${RUNNER_TEMP}/model-start-8"
+
+      - name: "Step 8: run the model"
+        id: m8
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s8.outputs.kind == 'model' }}
+        continue-on-error: true
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 40
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          # The model Verity named for this step, which is how the choice
+          # stays one decision in one place. `bluesky/auto` is the fallback
+          # for a Verity too old to name one — it is a router, and what it
+          # routes to has changed under us before, so it is not the default
+          # any run should land on silently.
+          model: ${{ steps.s8.outputs.model != '' && steps.s8.outputs.model || 'bluesky/auto' }}
+          prompt-file: ${{ runner.temp }}/prompt-8.md
+          output-file: ${{ steps.s8.outputs.output_file }}
+          # Verity decides read-only versus workspace-write, per step. The plan
+          # and review stages are read-only and cannot touch the checkout; only
+          # the dev cycle's own steps are allowed to write.
+          #
+          # Verity expresses filesystem authority only through this sandbox.
+          # `read-only` cannot modify the checkout; `workspace-write` is the
+          # only writable model mode.
+          sandbox: ${{ steps.s8.outputs.sandbox }}
+          # No legacy permission profile is layered on top of this sandbox.
+          # Pinning CODEX_HOME is what makes spend measurable: the Codex CLI
+          # writes its session rollout here, and the rollout is the only place
+          # token counts exist. The action itself exposes no usage output.
+        env:
+          # The request Codex actually sent, and the provider's answer to it.
+          #
+          # When a model step fails inside the provider, all the run can say
+          # today is Codex's own summary — "the provider rejected this request
+          # as invalid. Review the selected model, context size, tools, schema,
+          # and provider-specific parameters". That names five suspects and
+          # rules out none of them, and it is what a person is shown when their
+          # requirement comes back with nothing.
+          #
+          # This bundle records `InferenceStarted` with the request payload and
+          # `InferenceFailed` with the provider's `x-request-id`, which is the
+          # one identifier a provider can look a failure up by. It is written
+          # per slot, uploaded with the run's other evidence, and costs nothing
+          # on a run that succeeds.
+          CODEX_ROLLOUT_TRACE_ROOT: ${{ runner.temp }}/codex-trace-8
+
+      - name: "Step 8: report the model step"
+        if: ${{ env.VERITY_FINISHED != 'true' && steps.s8.outputs.kind == 'model' }}
+        env:
+          STEP_ID: ${{ steps.s8.outputs.step_id }}
+          STEP_OUTCOME: ${{ steps.m8.outcome }}
+          OUTPUT_FILE: ${{ steps.s8.outputs.output_file }}
+          # This slot's own rollout, so the tokens reported are this step's.
+          CODEX_HOME: ${{ runner.temp }}/codex-home-8
+          # What was asked for, so the rollout scan can tell it apart from what
+          # answered. Without it the comparison is against an empty string and
+          # the router slug is reported back as the model that did the work,
+          # which is the one answer that says nothing.
+          CODEX_MODEL: ${{ steps.s8.outputs.model != '' && steps.s8.outputs.model || 'bluesky/auto' }}
+          # Both halves of "was this a timeout?", answered where the
+          # answer is knowable rather than guessed at read time.
+          MODEL_START_FILE: ${{ runner.temp }}/model-start-8
+          MODEL_TIMEOUT_MINUTES: "40"
+        run: python "${RUNNER_TEMP}/verity_runner.py" report-model-step
+
+      - name: Ask Verity for the verdict
+        id: verdict
+        if: ${{ always() && env.VERITY_FINISHED != 'true' }}
+        # Drains anything left — the closing commands of a stage whose last
+        # model step has already run — and settles the job.
+        run: python "${RUNNER_TEMP}/verity_runner.py" step
+
+      - name: Stop heartbeats
+        if: ${{ always() }}
+        run: |
+          if [ -f "${RUNNER_TEMP}/heartbeat.pid" ]; then
+            kill "$(cat "${RUNNER_TEMP}/heartbeat.pid")" 2>/dev/null || true
+          fi
+
+      # A run that died in setup still has to say so. Without this the job sits
+      # live until the reaper finds it, and for those three minutes the person
+      # waiting sees steady progress that is not happening.
+      - name: Report an unfinished run
+        if: ${{ failure() || cancelled() }}
+        run: python "${RUNNER_TEMP}/verity_runner.py" report-abort --message "The agent run stopped before it finished. See the GitHub Actions log for this run."
+
+      # The full output of every command, whatever happened. The event log in
+      # Verity carries the tail of each one and says when it was cut; this is
+      # the uncut copy it points at. Dropping it would make a truncated event
+      # the only record, which is evidence lost.
+      - name: Upload the run's logs and outputs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-agent-${{ inputs.job_id }}
+          path: |
+            ${{ runner.temp }}/verity-logs
+            ${{ runner.temp }}/codex-trace-*
+            verity-*.md
+          if-no-files-found: ignore

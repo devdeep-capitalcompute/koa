@@ -1,0 +1,384 @@
+name: Verity Codex Test Failure -> Issue
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit SHA (optional)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Do not create issue, only generate issue.json (true/false)"
+        required: false
+        default: "false"
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+      feedback_id:
+        description: "Verity feedback item being verified (echoed back so the result can be attributed)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+# Keyed on the commit being triaged, not the run id, so two dispatches for the
+# same failure queue instead of racing each other's search-then-create dedup
+# check — without this, two simultaneous runs can both find no existing issue
+# and both create one for the same underlying failure.
+concurrency:
+  group: verity-test-to-issue-${{ github.repository }}-${{ inputs.sha != '' && inputs.sha || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.sha != '' && inputs.sha || github.sha }}
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}" ]; then
+            echo "Missing required secret MULTRA_API_KEY or BLUESKY_API_KEY" >&2
+            exit 1
+          fi
+          if [ -z "${{ secrets.VERITY_PROJECT_TOKEN }}" ]; then
+            echo "Missing required secret VERITY_PROJECT_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Detect GitHub App write-token config
+        id: gh_write_cfg
+        env:
+          VERITY_GITHUB_APP_ID: ${{ secrets.VERITY_GITHUB_APP_ID }}
+          VERITY_GITHUB_APP_PRIVATE_KEY: ${{ secrets.VERITY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "$VERITY_GITHUB_APP_ID" ] && [ -n "$VERITY_GITHUB_APP_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve GitHub write token (optional GitHub App)
+        id: gh_write_token
+        if: ${{ steps.gh_write_cfg.outputs.enabled == 'true' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.VERITY_GITHUB_APP_ID }}
+          private-key: ${{ secrets.VERITY_GITHUB_APP_PRIVATE_KEY }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import os
+          from pathlib import Path
+          import yaml
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          commands = cfg.get("commands", {}) or {}
+          automation = cfg.get("automation", {}) or {}
+          workflow_enablement = automation.get("workflow_enablement", {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+          def norm_list(v):
+            if v is None: return []
+            if isinstance(v, list): return [str(x) for x in v if str(x).strip()]
+            if isinstance(v, str) and v.strip(): return [v.strip()]
+            return []
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+            f.write(f"project_id={project_override or str(verity.get('project_id','')).strip()}\n")
+            f.write(f"callback_url={callback_override or str(verity.get('callback_url','')).strip()}\n")
+            f.write("setup_cmds<<EOF\n" + "\n".join(norm_list(commands.get("setup"))) + "\nEOF\n")
+            f.write("test_cmds<<EOF\n" + "\n".join(norm_list(commands.get("test"))) + "\nEOF\n")
+            # Self-checked here rather than trusted entirely to the caller, matching
+            # verity-command-router.yml and verity-pr-auto-fix.yml — defaults to
+            # false, same as those two, so a project has to opt in.
+            f.write(f"test_to_issue_enabled={'true' if bool(workflow_enablement.get('test_to_issue', False)) else 'false'}\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Notify Verity - started
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}"
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Run setup commands
+        if: ${{ steps.cfg.outputs.setup_cmds != '' }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::setup: $cmd"
+            bash -lc "$cmd"
+            echo "::endgroup::"
+          done <<< "${{ steps.cfg.outputs.setup_cmds }}"
+
+      - name: Re-run tests and capture output
+        id: rerun_tests
+        if: ${{ steps.cfg.outputs.test_to_issue_enabled == 'true' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          : > test-output.txt
+          if [ -z "${{ steps.cfg.outputs.test_cmds }}" ]; then
+            echo "No commands.test configured in .verity/config.yml" | tee -a test-output.txt
+            # Reported separately from a failure. Verity retries a failed retest
+            # and files a regression report against it; neither is right for a
+            # repository that has no tests to run, and without this flag the two
+            # are indistinguishable from the outside.
+            echo "tests_ran=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "tests_ran=true" >> "$GITHUB_OUTPUT"
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "=== RUN: $cmd" | tee -a test-output.txt
+            bash -lc "$cmd" 2>&1 | tee -a test-output.txt
+            echo "" | tee -a test-output.txt
+          done <<< "${{ steps.cfg.outputs.test_cmds }}"
+
+      - name: Decide if issue generation is required
+        id: triage_gate
+        run: |
+          # tests_ran=false means the rerun step exited 1 because there was nothing to
+          # run (no commands.test configured) — a config gap, not a code regression. It
+          # forces `outcome == failure` the same as a real failing test would, so gating
+          # on outcome alone used to file a bug issue about a missing test command. Gate
+          # on tests_ran first so a config gap is never reported as a bug.
+          if [ "${{ steps.cfg.outputs.test_to_issue_enabled }}" != "true" ]; then
+            echo "::notice::test-to-issue is disabled by .verity/config.yml. Set automation.workflow_enablement.test_to_issue=true to enable it."
+            echo "should_create=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.rerun_tests.outputs.tests_ran }}" != "true" ]; then
+            echo "::notice::No commands.test configured in .verity/config.yml — that's a config gap, not a code regression. Skipping issue creation."
+            echo "should_create=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.rerun_tests.outcome }}" = "failure" ]; then
+            echo "should_create=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Test(s) passed on rerun — not reproducible right now, so no issue is being filed. If this keeps recurring, it may be flaky rather than fixed."
+            echo "should_create=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fingerprints the actual failure — the commands that were run plus a
+      # normalized slice of what failed — instead of what Codex later writes
+      # about it. Codex's title/body/labels are free-form prose: the same
+      # underlying failure reworded differently across two runs used to hash
+      # to two different fingerprints, so the dedup this exists for silently
+      # didn't dedup. This is computed before Codex ever runs, so it's stable
+      # across reruns of the same failure regardless of how it gets described.
+      - name: Compute failure fingerprint
+        id: fingerprint
+        if: ${{ steps.triage_gate.outputs.should_create == 'true' }}
+        env:
+          TEST_CMDS: ${{ steps.cfg.outputs.test_cmds }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          import re
+          from pathlib import Path
+
+          test_cmds = os.environ.get("TEST_CMDS", "").strip()
+          output_path = Path("test-output.txt")
+          output = output_path.read_text(encoding="utf-8", errors="ignore") if output_path.exists() else ""
+
+          # Keep only lines that look like an actual failure signal — full test
+          # output is dominated by volatile noise (progress bars, timing, setup
+          # logs) that would drift the fingerprint run to run on its own.
+          signal_pattern = re.compile(r"(fail|error|exception|assert|✗|×)", re.I)
+          signal_lines = [line.strip() for line in output.splitlines() if signal_pattern.search(line)]
+
+          def normalize(line: str) -> str:
+            line = re.sub(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?Z?", "<ts>", line)
+            line = re.sub(r"\b[0-9a-f]{7,40}\b", "<hash>", line, flags=re.I)
+            line = re.sub(r"/[\w./-]*/work/[\w.-]+/[\w.-]+/", "", line)
+            line = re.sub(r":\d+:\d+\b", ":<loc>", line)
+            line = re.sub(r"\s+", " ", line)
+            return line.strip()
+
+          # Sorted + deduped so line order (which can vary between parallel test
+          # runners) doesn't itself change the fingerprint, and capped so one huge,
+          # mostly-identical failure log can't drift the signature on unrelated tail
+          # noise.
+          signature = "\n".join(sorted(set(normalize(line) for line in signal_lines if line))[:40])
+          basis = f"{test_cmds}\n---\n{signature}"
+          fingerprint = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            handle.write(f"failure_fingerprint={fingerprint}\n")
+          PY
+
+      - name: Prepare Codex permission profile
+        shell: bash
+        run: |
+          # codex-action rewrites config.toml in CODEX_HOME to inject its proxy
+          # provider, so the profile is copied out of the checkout first.
+          mkdir -p "$RUNNER_TEMP/codex-home"
+          cp .github/codex/home/config.toml "$RUNNER_TEMP/codex-home/config.toml"
+          cp .github/codex/home/models.json "$RUNNER_TEMP/codex-home/models.json"
+
+      - name: Run Codex (generate issue.json)
+        id: run_codex
+        if: ${{ steps.triage_gate.outputs.should_create == 'true' }}
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 10
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          model: bluesky/auto
+          effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
+          prompt-file: .github/codex/prompts/test-to-issue.md
+          output-file: issue.json
+          sandbox: workspace-write
+          output-schema-file: .github/codex/schemas/issue.schema.json
+
+      - name: Create issue
+        id: create_issue
+        if: ${{ steps.triage_gate.outputs.should_create == 'true' && inputs.dry_run != 'true' }}
+        uses: actions/github-script@v7
+        env:
+          FAILURE_FINGERPRINT: ${{ steps.fingerprint.outputs.failure_fingerprint }}
+        with:
+          github-token: ${{ steps.gh_write_token.outputs.token || secrets.VERITY_GITHUB_WRITE_TOKEN || github.token }}
+          script: |
+            const fs = require("fs");
+            const crypto = require("crypto");
+            const issue = JSON.parse(fs.readFileSync("issue.json","utf8"));
+            // Prefer the failure-signature fingerprint (test command + normalized
+            // output, computed before Codex ran) so two runs of the same underlying
+            // failure dedupe even when Codex phrases the issue differently each
+            // time. Falls back to hashing Codex's own output only if that step
+            // didn't produce one for some reason — better than skipping dedup
+            // entirely, though it inherits the same prose-drift weakness this fix
+            // is meant to close.
+            const fingerprint = process.env.FAILURE_FINGERPRINT || crypto
+              .createHash('sha256')
+              .update(JSON.stringify({
+                title: issue.title || '',
+                body: issue.body || '',
+                labels: issue.labels || []
+              }))
+              .digest('hex')
+              .slice(0, 16);
+            const marker = `<!-- verity-fingerprint:${fingerprint} -->`;
+            const query = `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open "verity-fingerprint:${fingerprint}"`;
+            const existing = await github.rest.search.issuesAndPullRequests({ q: query, per_page: 1 });
+
+            if (existing.data.items && existing.data.items.length > 0) {
+              const item = existing.data.items[0];
+              core.setOutput('issue_number', String(item.number));
+              core.setOutput('issue_url', item.html_url);
+              core.setOutput('deduped', 'true');
+              core.info(`Deduped to existing issue: ${item.html_url}`);
+              return;
+            }
+
+            const created = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: issue.title,
+              body: `${issue.body || ''}\n\n${marker}`.trim(),
+              labels: issue.labels,
+            });
+            core.setOutput('issue_number', String(created.data.number));
+            core.setOutput('issue_url', created.data.html_url);
+            core.setOutput('deduped', 'false');
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-test-to-issue
+          path: |
+            test-output.txt
+            issue.json
+          if-no-files-found: ignore
+
+      - name: Notify Verity - completed
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          JOB_STATUS: ${{ job.status }}
+          TESTS_FAILED: ${{ steps.triage_gate.outputs.should_create }}
+          TESTS_RAN: ${{ steps.rerun_tests.outputs.tests_ran }}
+          FEEDBACK_ID: ${{ inputs.feedback_id }}
+          ISSUE_NUMBER: ${{ steps.create_issue.outputs.issue_number }}
+          ISSUE_URL: ${{ steps.create_issue.outputs.issue_url }}
+          ISSUE_DEDUPED: ${{ steps.create_issue.outputs.deduped }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os, pathlib
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": os.environ.get("JOB_STATUS"),
+            "tests_failed": os.environ.get("TESTS_FAILED") == "true",
+            "tests_ran": os.environ.get("TESTS_RAN") == "true",
+            "feedback_id": os.environ.get("FEEDBACK_ID") or None,
+            "dry_run": os.environ.get("DRY_RUN") == "true",
+            "created_issue_number": os.environ.get("ISSUE_NUMBER") or None,
+            "created_issue_url": os.environ.get("ISSUE_URL") or None,
+            "issue_deduped": os.environ.get("ISSUE_DEDUPED") == "true"
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true

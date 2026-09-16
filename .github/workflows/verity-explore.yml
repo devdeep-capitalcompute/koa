@@ -1,0 +1,231 @@
+name: Verity Explore
+
+# Crawl a running application and report what is broken, with evidence.
+#
+# This runs here, in your repository, rather than on Verity's infrastructure,
+# for two reasons. A GitHub runner allows six hours where a Lambda allows
+# fifteen minutes, which is the difference between walking an application and
+# glancing at one page of it. And the repository is checked out on the runner,
+# so a console error reporting `at /assets/checkout-a1b2.js:42` can be resolved
+# to the file that produced it — a finding that names a file is one an engineer
+# can act on.
+#
+# It signs in when the repository holds credentials for the app, because almost
+# everything worth testing is behind the login. Signing in to *look* is a read;
+# submitting forms and deleting records is not, and this does not do those. It
+# also leaves alone any link whose address reads like a mutation — /delete,
+# /remove, sign-out — unless the environment is confirmed to have its own data
+# store.
+#
+# Credentials come from this repository's own Actions secrets, never from the
+# workflow inputs below: inputs are shown in the Actions UI and recorded in the
+# run. If they are absent the crawl still runs, signed out, and says so.
+#
+# A sign-in that does not work stops the run. A crawl that walks a login wall
+# and reports "nothing broken" has tested nothing and claimed everything.
+#
+# Your complete console and network logs are uploaded as this workflow's own
+# artifacts and stay in your GitHub account. What is sent back to Verity is
+# governed by `policies.privacy` in `.verity/config.yml`, and defaults to
+# findings and counts only — never file contents.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "The address to explore. Verity always sends one; there is no default, because guessing a target is how a run tests the wrong application."
+        required: true
+      max_pages:
+        description: "Stop after this many pages."
+        required: false
+        default: "25"
+      max_depth:
+        description: "How many links from the entry point to follow."
+        required: false
+        default: "3"
+      budget_minutes:
+        description: "Wall-clock budget. The crawl stops cleanly and reports what it found."
+        required: false
+        default: "20"
+      run_id:
+        description: "Verity's identifier for this exploration, echoed back on the callback."
+        required: false
+        default: ""
+      login_url:
+        description: "Where to sign in, if it is not <address>/login. Never put credentials here — inputs are visible in the Actions UI."
+        required: false
+        default: ""
+      environment_isolated:
+        description: "Set to true only when this environment's data store is confirmed separate from production's. It widens which links the crawl will follow."
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  # One exploration per repository at a time. Two crawls of the same site race
+  # for the same rate limits and produce findings neither can explain.
+  group: verity-explore-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    # Deliberately above the largest budget the input allows, so the crawl's own
+    # limit is what stops it and the report is always written.
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load Verity config
+        id: cfg
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          privacy = ((cfg.get("policies", {}) or {}).get("privacy", {}) or {})
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            handle.write(f"project_id={str(verity.get('project_id','')).strip()}\n")
+            handle.write(f"callback_url={str(verity.get('callback_url','')).strip()}\n")
+            # Both default to False, matching the shipped config. A project that
+            # has not decided has decided not to share.
+            handle.write(f"send_raw_logs={'true' if privacy.get('send_raw_logs_to_verity') is True else 'false'}\n")
+            handle.write(f"send_source_paths={'true' if privacy.get('send_raw_source_to_verity') is True else 'false'}\n")
+          PY
+
+      - name: Install Playwright
+        run: |
+          npm install --no-save playwright@1.57.0
+          npx playwright install --with-deps chromium
+
+      - name: Explore
+        id: explore
+        continue-on-error: true
+        env:
+          VERITY_EXPLORE_URL: ${{ inputs.url }}
+          VERITY_EXPLORE_MAX_PAGES: ${{ inputs.max_pages }}
+          VERITY_EXPLORE_MAX_DEPTH: ${{ inputs.max_depth }}
+          VERITY_EXPLORE_BUDGET_MINUTES: ${{ inputs.budget_minutes }}
+          VERITY_EXPLORE_RUN_ID: ${{ inputs.run_id }}
+          VERITY_SEND_RAW_LOGS: ${{ steps.cfg.outputs.send_raw_logs }}
+          VERITY_SEND_SOURCE_PATHS: ${{ steps.cfg.outputs.send_source_paths }}
+          VERITY_EXPLORE_LOGIN_URL: ${{ inputs.login_url }}
+          VERITY_ENVIRONMENT_ISOLATED: ${{ inputs.environment_isolated }}
+          # From this repository's secrets, so they are masked in the log and
+          # never appear in the run's inputs. Absent is fine: the crawl runs
+          # signed out and the report says which surface it saw.
+          VERITY_APP_EMAIL: ${{ secrets.VERITY_APP_EMAIL }}
+          VERITY_APP_PASSWORD: ${{ secrets.VERITY_APP_PASSWORD }}
+        run: node scripts/verity_explore.mjs
+
+      - name: Upload exploration artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-exploration
+          path: .verity/exploration
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Report to Verity
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          VERITY_RUN_ID: ${{ inputs.run_id }}
+          VERITY_EXPLORE_URL: ${{ inputs.url }}
+          EXPLORE_OUTCOME: ${{ steps.explore.outcome }}
+        run: |
+          if [ -z "$VERITY_PROJECT_TOKEN" ]; then
+            echo "Skipping Verity callback: no project token"
+            exit 0
+          fi
+          # Bootstrap substitutes the callback-URL placeholder everywhere in a
+          # rendered file, so an empty-string check alone misses an
+          # unsubstituted placeholder that isn't empty, just not a real URL. A
+          # missing scheme catches both.
+          case "$VERITY_CALLBACK_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "Skipping Verity callback: callback URL not configured or not substituted"
+              exit 0
+              ;;
+          esac
+
+          python - <<'PY' > /tmp/verity-explore-callback.json
+          import json
+          import os
+          from pathlib import Path
+
+          report_path = Path(".verity/exploration/report.json")
+          report = {}
+          if report_path.exists():
+            try:
+              report = json.loads(report_path.read_text())
+            except Exception as error:
+              print(f"Could not read report: {error}")
+
+          # A crawl that produced no report still reports itself. Silence would
+          # leave the run pending forever with nothing to explain why.
+          payload = {
+            "event": "workflow_completed",
+            "workflow": "verity-explore.yml",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "branch": os.environ.get("GITHUB_REF_NAME"),
+            "exploration_id": os.environ.get("VERITY_RUN_ID") or report.get("runId"),
+            "start_url": os.environ.get("VERITY_EXPLORE_URL"),
+            "outcome": os.environ.get("EXPLORE_OUTCOME"),
+            "report": {
+              "stopReason": report.get("stopReason", "no-report"),
+              # Which surface was explored. A signed-out crawl and a signed-in
+              # one are not the same evidence.
+              "authState": report.get("authState"),
+              "authFailureReason": report.get("authFailureReason"),
+              "pagesVisited": report.get("pagesVisited", 0),
+              "durationMs": report.get("durationMs", 0),
+              "findingCount": report.get("findingCount", 0),
+              "bySeverity": report.get("bySeverity", {}),
+              "pages": report.get("pages", []),
+              "findings": report.get("findings", []),
+            },
+          }
+          print(json.dumps(payload))
+          PY
+
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-explore-callback.json || true
+
+      - name: Fail only if the crawl itself broke
+        if: ${{ steps.explore.outcome == 'failure' }}
+        run: |
+          echo "The exploration script did not complete. Findings about your app, if any, are in the artifacts above." >&2
+          exit 1

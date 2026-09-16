@@ -1,0 +1,1530 @@
+name: Verity Codex Dev Cycle
+
+# Carries the dispatch correlation id into the run's display title. `workflow_dispatch`
+# answers 204 with no run id, so this is how Verity binds a dispatch to the real run it
+# created — which is what makes tracking, linking and cancelling that run possible.
+run-name: >-
+  Verity Codex Dev Cycle${{ inputs.issue_number != '' && format(' · #{0}', inputs.issue_number) || '' }}${{ inputs.dispatch_id != '' && format(' · {0}', inputs.dispatch_id) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number (optional)"
+        required: false
+        default: ""
+      user_request:
+        description: "What to implement/fix (optional)"
+        required: false
+        default: ""
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+      branch_name:
+        description: "PR branch name override (optional). Pass a stable name (e.g. verity/feedback-<slug>-<issue#>) so re-dispatches update the same PR instead of opening a new one."
+        required: false
+        default: ""
+      session_id:
+        description: "Verity coding session id (optional)"
+        required: false
+        default: ""
+      focus_paths:
+        description: "Newline or comma-separated paths the agent should start from (optional)"
+        required: false
+        default: ""
+      # The side channel for everything that does not have to be a first-class
+      # input. `workflow_dispatch` accepts at most 10 inputs, and that is a hard
+      # GitHub limit applied when the workflow file is parsed — an eleventh does
+      # not merely lint badly, it makes the entire workflow undispatchable. This
+      # file had grown to 12, so every API dispatch of it was rejected outright
+      # and the only dev cycle Verity can start is an API dispatch.
+      #
+      # `pr_title` and `verity_delivery_id` are the two that moved in here,
+      # because neither is needed before a step exists to read them: `pr_title`
+      # is pull-request metadata whose siblings (`pr_labels`, `pr_draft`,
+      # `auto_merge`) already lived here, and `verity_delivery_id` is a
+      # pass-through join key that is only ever echoed back on callbacks.
+      #
+      # `dispatch_id` deliberately stayed a real input. `run-name` evaluates it
+      # at dispatch time, before any step could parse JSON, and that run name is
+      # the only thing binding a dispatch to the run id GitHub creates for it.
+      context_json:
+        description: "Compact JSON for session/PR/correlation metadata: session_title, attempt_id, attachment_manifest_url, pr_title, pr_labels, pr_draft, allow_docs_only_pr, auto_merge, verity_delivery_id"
+        required: false
+        default: "{}"
+      enable_pr_creation:
+        description: "Explicitly allow this run to create/update a PR (true/false)"
+        required: true
+        default: "false"
+      dispatch_id:
+        description: "Verity-internal correlation id for this dispatch attempt (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: verity-dev-cycle-${{ github.repository }}-${{ inputs.session_id != '' && inputs.session_id || (inputs.issue_number != '' && inputs.issue_number || github.ref_name) }}
+  cancel-in-progress: true
+
+jobs:
+  dev_cycle:
+    runs-on: ubuntu-latest
+    # The self-heal loop's own Codex step timeouts alone can reach 65 minutes in
+    # the worst case a run actually exercises every retry path: 25 (main
+    # implementation run) + 10 (test-fix) + 10 (build-fix) + 10 (e2e-fix attempt
+    # 1) + 10 (e2e-fix attempt 2). A 45-minute job timeout could kill that run
+    # mid-flight before it ever reaches the final push/PR-handoff step, losing
+    # completed work with only a partial completion callback. Raised to cover
+    # that worst case plus the checkout/install/setup steps and the actual
+    # test/build/e2e command executions that run alongside the Codex steps.
+    timeout-minutes: 90
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+
+    steps:
+      - name: Checkout (default branch)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Verity is supposed to be the sole owner of Git history during a coding
+      # run: Codex only edits files in the workspace, and every git command
+      # that moves history (checkout -b, commit, push) runs later, in
+      # Verity's own steps. Recording the branch/HEAD here, before Codex ever
+      # runs, gives "Verify Codex did not move Git HEAD or branch" something
+      # trustworthy to compare against.
+      - name: Record pre-Codex Git state
+        id: git_state
+        run: |
+          echo "expected_branch=$(git branch --show-current)" >> "$GITHUB_OUTPUT"
+          echo "expected_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}" ]; then
+            echo "Missing required secret MULTRA_API_KEY or BLUESKY_API_KEY" >&2
+            exit 1
+          fi
+          if [ -z "${{ secrets.VERITY_PROJECT_TOKEN }}" ]; then
+            echo "Missing required secret VERITY_PROJECT_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Detect GitHub App write-token config
+        id: gh_write_cfg
+        env:
+          VERITY_GITHUB_APP_ID: ${{ secrets.VERITY_GITHUB_APP_ID }}
+          VERITY_GITHUB_APP_PRIVATE_KEY: ${{ secrets.VERITY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "$VERITY_GITHUB_APP_ID" ] && [ -n "$VERITY_GITHUB_APP_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve GitHub write token (optional GitHub App)
+        id: gh_write_token
+        if: ${{ steps.gh_write_cfg.outputs.enabled == 'true' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.VERITY_GITHUB_APP_ID }}
+          private-key: ${{ secrets.VERITY_GITHUB_APP_PRIVATE_KEY }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          cfg_path = Path(".verity/config.yml")
+          if not cfg_path.exists():
+            raise SystemExit("Missing .verity/config.yml (bootstrap incomplete)")
+
+          cfg = yaml.safe_load(cfg_path.read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          commands = cfg.get("commands", {}) or {}
+          policies = cfg.get("policies", {}) or {}
+          automation = cfg.get("automation", {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+
+          def norm_list(v):
+            if v is None: return []
+            if isinstance(v, list): return [str(x) for x in v if str(x).strip()]
+            if isinstance(v, str) and v.strip(): return [v.strip()]
+            return []
+
+          docs_auto = bool((policies.get("documentation", {}) or {}).get("auto_mode", False))
+
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+            f.write(f"project_id={project_override or str(verity.get('project_id','')).strip()}\n")
+            f.write(f"callback_url={callback_override or str(verity.get('callback_url','')).strip()}\n")
+            f.write("setup_cmds<<EOF\n" + "\n".join(norm_list(commands.get("setup"))) + "\nEOF\n")
+            f.write("test_cmds<<EOF\n" + "\n".join(norm_list(commands.get("test"))) + "\nEOF\n")
+            f.write("build_cmds<<EOF\n" + "\n".join(norm_list(commands.get("build"))) + "\nEOF\n")
+            f.write(f"docs_auto_mode={'true' if docs_auto else 'false'}\n")
+            f.write(f"pr_review_enabled={bool((policies.get('pr_review', {}) or {}).get('enabled', True))}\n")
+            f.write(f"pr_review_label={str((policies.get('pr_review', {}) or {}).get('label_required','verity:agent')).strip()}\n")
+            f.write(f"automation_paused={'true' if automation.get('paused') else 'false'}\n")
+            f.write(f"auto_create_pr_enabled={'true' if automation.get('auto_create_pr') else 'false'}\n")
+            f.write(f"auto_merge_pr_enabled={'true' if automation.get('auto_merge_pr') else 'false'}\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Parse compact workflow context
+        id: run_ctx
+        env:
+          CONTEXT_JSON: ${{ inputs.context_json }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+
+          raw = os.environ.get("CONTEXT_JSON") or "{}"
+
+          # Every key this workflow reads out of `context_json`. `pr_title` and
+          # `verity_delivery_id` used to be workflow_dispatch inputs of their own
+          # and moved in here when the input list hit GitHub's cap of 10 — see the
+          # comment on the `context_json` input above.
+          defaults = {
+            "session_title": "",
+            "attempt_id": "",
+            "attachment_manifest_url": "",
+            "pr_title": "",
+            "pr_labels": "verity:agent,verity:codex",
+            "pr_draft": "false",
+            "allow_docs_only_pr": "false",
+            "auto_merge": "false",
+            "verity_delivery_id": "",
+            # Per-session model override. It travels in `context_json` rather
+            # than as its own input because `workflow_dispatch` is capped at 10
+            # and this file is at the cap: an eleventh input makes the whole
+            # workflow undispatchable, which is a total outage of the dev cycle.
+            "model": "",
+          }
+
+          BOOL_KEYS = {"pr_draft", "allow_docs_only_pr", "auto_merge"}
+
+          def normalize_bool(value):
+            return "true" if str(value).strip().lower() in {"1", "true", "yes", "on"} else "false"
+
+          def one_line(value):
+            # GITHUB_OUTPUT is line-oriented: a newline inside a value terminates
+            # the entry and the rest of the text is re-read as further outputs.
+            return " ".join(str(value or "").splitlines()).strip()
+
+          # `verity_delivery_id` is a join key, not an option. Releasing a
+          # delivery's lock requires naming it, so a run that cannot report it
+          # leaves the requirement it was implementing stuck with nothing able to
+          # free it. Malformed JSON fails this step and therefore the job — but the
+          # callbacks below all run `if: always()`, so the id is recovered from the
+          # raw text and written out *before* anything here can abort.
+          values = dict(defaults)
+          match = re.search(r'"verity_delivery_id"\s*:\s*"([^"]*)"', raw)
+          values["verity_delivery_id"] = one_line(match.group(1) if match else "")
+
+          failure = None
+          try:
+            ctx = json.loads(raw)
+            if not isinstance(ctx, dict):
+              raise ValueError("expected a JSON object")
+          except (ValueError, TypeError) as exc:
+            # json.JSONDecodeError is a ValueError, so this covers both "not JSON"
+            # and "JSON, but not an object".
+            failure = f"context_json must be a JSON object: {exc}"
+          else:
+            for key, default in defaults.items():
+              value = ctx.get(key, default)
+              values[key] = normalize_bool(value) if key in BOOL_KEYS else one_line(value)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            for key, value in values.items():
+              handle.write(f"{key}={value}\n")
+
+          if failure:
+            raise SystemExit(failure)
+          PY
+
+      - name: Enforce PR creation gate
+        id: pr_gate
+        env:
+          INPUT_ENABLE_PR_CREATION: ${{ inputs.enable_pr_creation }}
+          INPUT_AUTO_MERGE: ${{ steps.run_ctx.outputs.auto_merge }}
+          CONFIG_AUTOMATION_PAUSED: ${{ steps.cfg.outputs.automation_paused }}
+          CONFIG_AUTO_CREATE_PR: ${{ steps.cfg.outputs.auto_create_pr_enabled }}
+          CONFIG_AUTO_MERGE_PR: ${{ steps.cfg.outputs.auto_merge_pr_enabled }}
+          VAR_ENABLE_AUTO_PR: ${{ vars.VERITY_ENABLE_AUTO_PR }}
+        run: |
+          normalize() {
+            val="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+            if [ "$val" = "1" ] || [ "$val" = "true" ] || [ "$val" = "yes" ] || [ "$val" = "on" ]; then
+              echo "true"
+            else
+              echo "false"
+            fi
+          }
+
+          if [ "$(normalize "$CONFIG_AUTOMATION_PAUSED")" = "true" ]; then
+            echo "PR creation blocked: automation.paused is true in .verity/config.yml." >&2
+            exit 1
+          fi
+
+          manual_enabled="$(normalize "$INPUT_ENABLE_PR_CREATION")"
+          config_enabled="$(normalize "$CONFIG_AUTO_CREATE_PR")"
+          var_enabled="$(normalize "$VAR_ENABLE_AUTO_PR")"
+
+          if [ "$manual_enabled" != "true" ] && { [ "$config_enabled" != "true" ] || [ "$var_enabled" != "true" ]; }; then
+            # Not opted in to opening a PR. That is a mode, not a failure: the
+            # run has already done (or is about to do) the actual work, and
+            # failing here threw all of it away — and left the linked story
+            # locked on "Implementation started" with nothing to release it.
+            # Downstream PR steps check `allowed`; everything else proceeds.
+            echo "PR creation not enabled: set workflow input enable_pr_creation=true for a manual run, or automation.auto_create_pr=true plus repo variable VERITY_ENABLE_AUTO_PR=true for automated runs. Continuing without opening a PR." >&2
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=pr-creation-not-enabled" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$(normalize "$INPUT_AUTO_MERGE")" = "true" ] && [ "$(normalize "$CONFIG_AUTO_MERGE_PR")" != "true" ]; then
+            echo "Auto-merge blocked: automation.auto_merge_pr is not true in .verity/config.yml." >&2
+            exit 1
+          fi
+
+          echo "allowed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run setup commands
+        if: ${{ steps.cfg.outputs.setup_cmds != '' }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::setup: $cmd"
+            bash -lc "$cmd"
+            echo "::endgroup::"
+          done <<< "${{ steps.cfg.outputs.setup_cmds }}"
+
+      - name: Notify Verity - started
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          VERITY_DELIVERY_ID: ${{ steps.run_ctx.outputs.verity_delivery_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          SESSION_ID: ${{ inputs.session_id }}
+          SESSION_TITLE: ${{ steps.run_ctx.outputs.session_title }}
+          ATTEMPT_ID: ${{ steps.run_ctx.outputs.attempt_id }}
+          SESSION_BRANCH: ${{ inputs.branch_name }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+        run: |
+          # Bootstrap substitutes the callback-URL placeholder everywhere in this file,
+          # including inside any equality check written against it — which turned this
+          # guard into "real URL equals real URL", skipping every callback while still
+          # exiting 0, so the step stayed green and Verity heard nothing. An
+          # unsubstituted placeholder has no URL scheme; test for that instead.
+          case "$VERITY_CALLBACK_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "Skipping callback: callback URL not configured"
+              exit 0
+              ;;
+          esac
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            # Hardcoded to match the filename Verity's dispatcher uses to key this run's
+            # tracking record — GITHUB_WORKFLOW is this workflow's human display name
+            # ("Verity Codex Dev Cycle"), which never matches and silently orphaned every
+            # dispatch-time record from its completion-time counterpart.
+            "workflow": "codex-dev-cycle.yml",
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "issue_number": os.environ.get("ISSUE_NUMBER") or None,
+            "branch": os.environ.get("SESSION_BRANCH") or None,
+            "session_id": os.environ.get("SESSION_ID") or None,
+            "session_title": os.environ.get("SESSION_TITLE") or None,
+            "attempt_id": os.environ.get("ATTEMPT_ID") or None,
+            "dispatch_id": os.environ.get("DISPATCH_ID") or None,
+            # The join key for everything this click started. Without it the
+            # dev cycle and the three test-generation runs beside it are four
+            # unrelated runs, and a lock cannot tell which of them is entitled
+            # to release it.
+            "verity_delivery_id": os.environ.get("VERITY_DELIVERY_ID") or None
+          }
+          print(json.dumps(payload))
+          PY
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Report stage - setup
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          VERITY_DELIVERY_ID: ${{ steps.run_ctx.outputs.verity_delivery_id }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          STAGE: setup
+          STAGE_STATUS: success
+        run: python scripts/verity_report_stage.py
+
+      - name: Fetch issue context (optional)
+        if: ${{ inputs.issue_number != '' && inputs.issue_number != '0' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.gh_write_token.outputs.token || secrets.VERITY_GITHUB_WRITE_TOKEN || github.token }}
+          script: |
+            const fs = require("fs");
+            const issue_number = Number(process.env.ISSUE_NUMBER);
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+            });
+            const sanitize = (s) => (s || "").replace(/<!--[\s\S]*?-->/g, "").slice(0, 20000);
+            fs.writeFileSync("issue_context.md", [
+              `# Issue #${issue_number}: ${issue.title}`,
+              "",
+              sanitize(issue.body),
+              "",
+            ].join("\n"));
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+
+      # ─── Install Node dependencies BEFORE anything that needs them ───
+      # Codex runs in a sandbox; without this the agent starts on a repo with a
+      # lockfile and an empty node_modules, and has to re-install for itself.
+      - name: Install Node dependencies
+        id: node_deps
+        run: |
+          set -uo pipefail
+          found=0
+          while IFS= read -r pkg; do
+            d=$(dirname "$pkg")
+            found=$((found+1))
+            if [ -d "$d/node_modules" ]; then
+              echo "$d - node_modules already present, skipping"
+              continue
+            fi
+            echo "::group::install dependencies in $d"
+            ok=1
+            if [ -f "$d/package-lock.json" ]; then
+              (cd "$d" && npm ci) || {
+                echo "::warning::npm ci failed in $d (lockfile out of sync?) - retrying with npm install"
+                (cd "$d" && npm install) || ok=0
+              }
+            else
+              (cd "$d" && npm install) || ok=0
+            fi
+            echo "::endgroup::"
+            if [ "$ok" != "1" ]; then
+              echo "::error::Dependency install failed in $d - later steps will run without node_modules"
+            fi
+          done < <(find . -maxdepth 3 -name package.json -not -path '*/node_modules/*')
+          if [ "$found" = "0" ]; then
+            echo "No Node package roots found (expected for non-Node repositories)"
+          fi
+
+      # ─── Install Playwright BEFORE Codex (drop-sudo kills sudo) ───
+      #
+      # Bounded, because `playwright install-deps` shells out to `apt-get
+      # update` and the runner's apt mirror is not always reachable: observed
+      # once stalling with no output for 9m30s (azure.archive.ubuntu.com
+      # unreachable, fallback to archive.ubuntu.com then hung mid-fetch) against
+      # a normal runtime of ~35s. Nothing below can start until this returns, so
+      # an unbounded hang here burns the job's whole 45-minute budget and the
+      # run ends with no PR at all.
+      #
+      # On timeout `continue-on-error` keeps the job alive and `pw_install`'s
+      # outcome is `failure`, which the E2E gate below already reads — so the
+      # browser tests are skipped and the run still delivers its PR. Losing the
+      # browser gate to a broken mirror is a far cheaper failure than losing the
+      # work.
+      - name: Install Playwright browsers (before Codex drops sudo)
+        continue-on-error: true
+        timeout-minutes: 5
+        id: pw_install
+        run: |
+          sudo npx playwright install-deps chromium
+          npx playwright install chromium
+
+      - name: Render Codex prompt (append runtime inputs)
+        env:
+          USER_REQUEST: ${{ inputs.user_request }}
+          SESSION_ID: ${{ inputs.session_id }}
+          SESSION_TITLE: ${{ steps.run_ctx.outputs.session_title }}
+          ATTEMPT_ID: ${{ steps.run_ctx.outputs.attempt_id }}
+          SESSION_BRANCH: ${{ inputs.branch_name }}
+          FOCUS_PATHS: ${{ inputs.focus_paths }}
+          ATTACHMENT_MANIFEST_URL: ${{ steps.run_ctx.outputs.attachment_manifest_url }}
+        run: |
+          set -euo pipefail
+          cat .github/codex/prompts/dev-cycle.md > codex-prompt.md
+          echo "" >> codex-prompt.md
+          echo "## Runtime inputs" >> codex-prompt.md
+          echo "" >> codex-prompt.md
+          echo "- Repo: ${GITHUB_REPOSITORY}" >> codex-prompt.md
+          echo "- Run URL: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> codex-prompt.md
+          echo "- Verity Project ID: ${{ steps.cfg.outputs.project_id }}" >> codex-prompt.md
+          if [ -n "${SESSION_ID:-}" ]; then
+            echo "- Coding session ID: ${SESSION_ID}" >> codex-prompt.md
+          fi
+          if [ -n "${SESSION_TITLE:-}" ]; then
+            echo "- Coding session title: ${SESSION_TITLE}" >> codex-prompt.md
+          fi
+          if [ -n "${ATTEMPT_ID:-}" ]; then
+            echo "- Coding session attempt ID: ${ATTEMPT_ID}" >> codex-prompt.md
+          fi
+          if [ -n "${SESSION_BRANCH:-}" ]; then
+            echo "- Session PR branch: ${SESSION_BRANCH}" >> codex-prompt.md
+          fi
+          if [ -n "${FOCUS_PATHS:-}" ]; then
+            echo "- Focus paths: ${FOCUS_PATHS}" >> codex-prompt.md
+          fi
+          if [ -n "${ATTACHMENT_MANIFEST_URL:-}" ]; then
+            echo "- Attachment manifest: ${ATTACHMENT_MANIFEST_URL}" >> codex-prompt.md
+          fi
+          if [ -n "${USER_REQUEST:-}" ]; then
+            echo "" >> codex-prompt.md
+            echo "## User request" >> codex-prompt.md
+            echo "" >> codex-prompt.md
+            printf '%s\n' "$USER_REQUEST" >> codex-prompt.md
+          fi
+          if [ -f issue_context.md ]; then
+            echo "" >> codex-prompt.md
+            echo "## Issue context" >> codex-prompt.md
+            echo "" >> codex-prompt.md
+            cat issue_context.md >> codex-prompt.md
+          fi
+
+      - name: Prepare Codex permission profile
+        shell: bash
+        run: |
+          # codex-action rewrites config.toml in CODEX_HOME to inject its proxy
+          # provider, so the profile is copied out of the checkout first.
+          mkdir -p "$RUNNER_TEMP/codex-home"
+          cp .github/codex/home/config.toml "$RUNNER_TEMP/codex-home/config.toml"
+          cp .github/codex/home/models.json "$RUNNER_TEMP/codex-home/models.json"
+
+      - name: Run Codex (workspace edits allowed)
+        id: run_codex
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 25
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          model: bluesky/auto
+          effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
+          prompt-file: codex-prompt.md
+          output-file: codex-output.md
+          sandbox: workspace-write
+
+      # A dev cycle exists to produce a change. Finishing with a clean tree is
+      # never a successful delivery — but it used to exit 0, so the run went
+      # green, no branch was pushed, no PR opened, and the requirement stayed
+      # locked at "Implementation started" with nothing to explain it.
+      #
+      # This was observed with Codex reporting a complete, validated
+      # implementation (files, unit tests, `npm test` passed) while
+      # `git status` was empty — its edits never reached the workspace. The
+      # pipeline could not tell that apart from "did nothing", and called both
+      # success. Checked here, immediately after Codex, before docs sync,
+      # test-fix passes or artifact cleanup can touch the tree, so the state
+      # reported is the state Codex actually left.
+      #
+      # The output file only chooses the wording; the outcome is decided by git
+      # alone, so a change in how the model formats its summary cannot turn a
+      # failure into a pass.
+      - name: Verify Codex changes reached the workspace
+        if: ${{ steps.run_codex.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Codex changes are present in the workspace."
+            exit 0
+          fi
+
+          claimed=""
+          if [ -f codex-output.md ] && grep -qiE '`[^`]+\.[a-z0-9]+`' codex-output.md; then
+            claimed="yes"
+          fi
+
+          if [ -n "$claimed" ]; then
+            echo "::error::Codex reported file changes but the workspace is unchanged (\`git status\` is empty). Its edits did not reach the job's filesystem, so there is nothing to open a pull request from. This is a sandbox/workspace fault, not an empty task — failing rather than reporting a green run that delivered nothing."
+            echo "--- what Codex reported ---"
+            sed -n '1,80p' codex-output.md
+          else
+            echo "::error::The dev cycle finished without changing anything. Nothing can be delivered for this requirement, so the run is marked failed rather than green-with-no-result. If the requirement is already implemented, close it instead of re-running."
+          fi
+          exit 1
+
+      - name: Report stage - implement
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          VERITY_DELIVERY_ID: ${{ steps.run_ctx.outputs.verity_delivery_id }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          STAGE: implement
+          STAGE_STATUS: ${{ steps.run_codex.outcome }}
+        run: python scripts/verity_report_stage.py
+
+      - name: Sync docs context (auto document mode)
+        if: ${{ steps.cfg.outputs.docs_auto_mode == 'true' }}
+        run: python scripts/sync_repo_docs.py
+
+      # â”€â”€â”€ UNIT TESTS (self-healing: 1 Codex retry) â”€â”€â”€
+
+      - name: Run tests pass 1 (capture errors for potential Codex fix)
+        id: test_pass1
+        if: ${{ steps.cfg.outputs.test_cmds != '' }}
+        continue-on-error: true
+        run: |
+          rm -f test-error.txt
+          test_failed=false
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::test: $cmd"
+            set +e
+            bash -lc "$cmd" 2>&1 | tee -a test-error.txt
+            cmd_exit=${PIPESTATUS[0]}
+            set -e
+            echo "::endgroup::"
+            if [ "$cmd_exit" -ne 0 ]; then
+              test_failed=true
+              break
+            fi
+          done <<< "${{ steps.cfg.outputs.test_cmds }}"
+          echo "test_failed=${test_failed}" >> "$GITHUB_OUTPUT"
+          if [ "$test_failed" = "true" ]; then
+            exit 1
+          fi
+
+      - name: Prepare Codex test-fix prompt
+        if: ${{ steps.test_pass1.outputs.test_failed == 'true' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Codex Unit Test Fix Pass"
+            echo ""
+            echo "Unit tests failed. Fix ONLY the source files causing the errors below."
+            echo ""
+            echo "### Required process for EACH failing file:"
+            echo "1. **Read the full current content** of the file first â€” do not rewrite from memory."
+            echo "2. Apply a **minimal, surgical fix** â€” change only the lines causing the error."
+            echo "3. Write the fixed file using Python pathlib."
+            echo "4. Fix the **source code** unless the test itself has a bug (test references a renamed function, deleted feature, etc.)."
+            echo ""
+            echo "### Rules:"
+            echo "- Read the file BEFORE writing. Never overwrite with stale or partial content."
+            echo "- Preserve ALL existing code â€” only change what the error requires."
+            echo "- Do NOT add new features or refactor unrelated code."
+            echo ""
+            echo "## Test error output"
+            echo ""
+            echo '```'
+            cat test-error.txt
+            echo '```'
+          } > codex-test-fix-prompt.md
+
+      - name: Prepare Codex permission profile
+        shell: bash
+        run: |
+          # codex-action rewrites config.toml in CODEX_HOME to inject its proxy
+          # provider, so the profile is copied out of the checkout first.
+          mkdir -p "$RUNNER_TEMP/codex-home"
+          cp .github/codex/home/config.toml "$RUNNER_TEMP/codex-home/config.toml"
+          cp .github/codex/home/models.json "$RUNNER_TEMP/codex-home/models.json"
+
+      - name: Run Codex test fix
+        if: ${{ steps.test_pass1.outputs.test_failed == 'true' }}
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 10
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          model: bluesky/auto
+          effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
+          prompt-file: codex-test-fix-prompt.md
+          output-file: codex-test-fix-output.md
+          sandbox: workspace-write
+
+      - name: Run tests pass 2 (final)
+        id: test_pass2
+        if: ${{ steps.test_pass1.outputs.test_failed == 'true' }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::test pass 2: $cmd"
+            bash -lc "$cmd"
+            echo "::endgroup::"
+          done <<< "${{ steps.cfg.outputs.test_cmds }}"
+
+      # â”€â”€â”€ BUILD (self-healing: 1 Codex retry) â”€â”€â”€
+
+      - name: Report stage - tests
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          VERITY_DELIVERY_ID: ${{ steps.run_ctx.outputs.verity_delivery_id }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          STAGE: verify.tests
+          # A skipped step has no outputs, so `test_failed` reads as empty, which
+          # is not 'true', which used to report `success` — the workflow telling
+          # Verity the tests passed on a repository that has no test command
+          # configured and never ran one. `outcome` is the only field that can
+          # tell "did not run" from "ran and was fine", so it is checked first.
+          # Pass 2 exists precisely to turn a failing pass 1 green, so when it
+          # ran and succeeded it is the answer.
+          STAGE_STATUS: >-
+            ${{ steps.test_pass1.outcome == 'skipped' && 'skipped'
+            || (steps.test_pass2.outcome == 'success' && 'success')
+            || (steps.test_pass1.outputs.test_failed == 'true' && 'failure')
+            || 'success' }}
+          STAGE_DETAIL: >-
+            ${{ steps.test_pass1.outcome == 'skipped'
+            && 'No test command configured for this repository'
+            || format('pass 1 {0}', steps.test_pass1.outcome) }}
+        run: python scripts/verity_report_stage.py
+
+      - name: Install dependencies (for any modified package.json)
+        if: ${{ steps.cfg.outputs.build_cmds != '' }}
+        run: |
+          set -euo pipefail
+          modified=$(git diff --name-only HEAD | grep -E '(^|/)package\.json$' || true)
+          install_dirs=""
+          if [ -n "$modified" ]; then
+            while IFS= read -r f; do
+              d=$(dirname "$f")
+              echo "package.json changed in $d â€” running npm install"
+              (cd "$d" && npm install)
+              install_dirs="$install_dirs:$d:"
+            done <<< "$modified"
+          fi
+          while IFS= read -r lockfile; do
+            d=$(dirname "$lockfile")
+            if [[ ":$install_dirs:" != *":$d:"* ]] && [ ! -d "$d/node_modules" ]; then
+              echo "Running npm ci in $d"
+              (cd "$d" && npm ci) || true
+            fi
+          done < <(find . -name 'package-lock.json' -not -path '*/node_modules/*')
+
+      - name: Run build pass 1 (capture errors for potential Codex fix)
+        id: build_pass1
+        if: ${{ steps.cfg.outputs.build_cmds != '' }}
+        continue-on-error: true
+        run: |
+          rm -f build-error.txt
+          build_failed=false
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::build: $cmd"
+            set +e
+            bash -lc "$cmd" 2>&1 | tee -a build-error.txt
+            cmd_exit=${PIPESTATUS[0]}
+            set -e
+            echo "::endgroup::"
+            if [ "$cmd_exit" -ne 0 ]; then
+              build_failed=true
+              break
+            fi
+          done <<< "${{ steps.cfg.outputs.build_cmds }}"
+          echo "build_failed=${build_failed}" >> "$GITHUB_OUTPUT"
+          if [ "$build_failed" = "true" ]; then
+            exit 1
+          fi
+
+      - name: Prepare Codex build-fix prompt
+        if: ${{ steps.build_pass1.outputs.build_failed == 'true' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Codex Build Fix Pass"
+            echo ""
+            echo "The previous build failed. Fix ONLY the source files causing the errors below."
+            echo ""
+            echo "### Required process for EACH failing file:"
+            echo "1. **Read the full current content** of the file first â€” do not rewrite from memory."
+            echo "2. Apply a **minimal, surgical fix** â€” change only the lines causing the error."
+            echo "3. Write the fixed file using Python pathlib."
+            echo ""
+            echo "### Rules:"
+            echo "- Read the file BEFORE writing. Never overwrite with stale or partial content."
+            echo "- Preserve ALL existing code â€” only change what the error requires."
+            echo "- Do NOT add new features or refactor unrelated code."
+            echo "- If the error mentions a missing import or component, check if the file exists before creating it."
+            echo ""
+            echo "## Build error output"
+            echo ""
+            echo '```'
+            cat build-error.txt
+            echo '```'
+          } > codex-fix-prompt.md
+
+      - name: Prepare Codex permission profile
+        shell: bash
+        run: |
+          # codex-action rewrites config.toml in CODEX_HOME to inject its proxy
+          # provider, so the profile is copied out of the checkout first.
+          mkdir -p "$RUNNER_TEMP/codex-home"
+          cp .github/codex/home/config.toml "$RUNNER_TEMP/codex-home/config.toml"
+          cp .github/codex/home/models.json "$RUNNER_TEMP/codex-home/models.json"
+
+      - name: Run Codex pass 2 (fix build errors)
+        if: ${{ steps.build_pass1.outputs.build_failed == 'true' }}
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 10
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          model: bluesky/auto
+          effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
+          prompt-file: codex-fix-prompt.md
+          output-file: codex-fix-output.md
+          sandbox: workspace-write
+
+      - name: Re-install dependencies after Codex build fix
+        if: ${{ steps.build_pass1.outputs.build_failed == 'true' }}
+        run: |
+          set -euo pipefail
+          modified=$(git diff --name-only HEAD | grep -E '(^|/)package\.json$' || true)
+          install_dirs=""
+          if [ -n "$modified" ]; then
+            while IFS= read -r f; do
+              d=$(dirname "$f")
+              echo "package.json changed in $d â€” running npm install"
+              (cd "$d" && npm install)
+              install_dirs="$install_dirs:$d:"
+            done <<< "$modified"
+          fi
+          while IFS= read -r lockfile; do
+            d=$(dirname "$lockfile")
+            if [[ ":$install_dirs:" != *":$d:"* ]] && [ ! -d "$d/node_modules" ]; then
+              echo "Running npm ci in $d"
+              (cd "$d" && npm ci) || true
+            fi
+          done < <(find . -name 'package-lock.json' -not -path '*/node_modules/*')
+
+      - name: Run build pass 2 (final)
+        id: build_pass2
+        if: ${{ steps.build_pass1.outputs.build_failed == 'true' }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::build pass 2: $cmd"
+            bash -lc "$cmd"
+            echo "::endgroup::"
+          done <<< "${{ steps.cfg.outputs.build_cmds }}"
+
+      - name: Report stage - build
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          VERITY_DELIVERY_ID: ${{ steps.run_ctx.outputs.verity_delivery_id }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          STAGE: verify.build
+          # Same skipped-step-has-no-outputs trap as `verify.tests` above.
+          STAGE_STATUS: >-
+            ${{ steps.build_pass1.outcome == 'skipped' && 'skipped'
+            || (steps.build_pass2.outcome == 'success' && 'success')
+            || (steps.build_pass1.outputs.build_failed == 'true' && 'failure')
+            || 'success' }}
+          STAGE_DETAIL: >-
+            ${{ steps.build_pass1.outcome == 'skipped'
+            && 'No build command configured for this repository'
+            || format('pass 1 {0}', steps.build_pass1.outcome) }}
+        run: python scripts/verity_report_stage.py
+
+      # ─── LAYER 1: BROWSER TESTING (e2e) ───
+      # Runs Playwright tests against locally running servers BEFORE the PR is
+      # created.  The same Codex instance that wrote the feature code can fix
+      # browser-test failures with full context (up to 3 attempts).
+      # Uses detect_repo_commands.py to auto-discover server start, base URL,
+      # and e2e commands â€” works with any client repo structure.
+      # If servers fail to start the e2e gate is skipped â€” not blocked.
+
+      - name: Resolve E2E commands
+        id: e2e_cfg
+        if: ${{ steps.pw_install.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          python scripts/detect_repo_commands.py --merge-config > .verity/resolved_commands.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          resolved = json.loads(Path(".verity/resolved_commands.json").read_text(encoding="utf-8"))
+          e2e = resolved.get("e2e", {}) or {}
+          groups = resolved.get("test_groups", {}) or {}
+          e2e_cmds = groups.get("e2e", []) or []
+          detected = bool(e2e.get("detected"))
+          runnable = bool(e2e.get("runnable"))
+          start_cmd = str(e2e.get("start_command") or "").strip()
+          base_url = str(e2e.get("base_url") or "").strip()
+          base_url_env = str(e2e.get("base_url_env") or "PLAYWRIGHT_BASE_URL").strip()
+          e2e_cmd = e2e_cmds[0] if e2e_cmds else ""
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+            f.write(f"detected={'true' if detected else 'false'}\n")
+            f.write(f"runnable={'true' if runnable else 'false'}\n")
+            f.write(f"start_command={start_cmd}\n")
+            f.write(f"base_url={base_url}\n")
+            f.write(f"base_url_env={base_url_env}\n")
+            f.write(f"e2e_command={e2e_cmd}\n")
+          PY
+
+      - name: Start local servers for browser testing
+        id: e2e_servers
+        if: ${{ steps.e2e_cfg.outputs.runnable == 'true' && steps.e2e_cfg.outputs.e2e_command != '' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          START_CMD="${{ steps.e2e_cfg.outputs.start_command }}"
+          BASE_URL="${{ steps.e2e_cfg.outputs.base_url }}"
+
+          if [ -z "$START_CMD" ]; then
+            echo "No start_command detected â€” skipping e2e"
+            echo "servers_ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Starting server: $START_CMD"
+          nohup bash -lc "$START_CMD" > /tmp/e2e-server.log 2>&1 &
+          echo "$!" > /tmp/e2e-server.pid
+
+          if [ -n "$BASE_URL" ]; then
+            echo "Waiting for $BASE_URL ..."
+            for i in $(seq 1 45); do
+              if curl -sS -o /dev/null -w '' --max-time 3 "$BASE_URL" 2>/dev/null; then
+                echo "Server ready at $BASE_URL"
+                echo "servers_ready=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "::warning::Server failed to start at $BASE_URL â€” skipping e2e tests"
+            echo "servers_ready=false" >> "$GITHUB_OUTPUT"
+          else
+            # No base_url â€” give the server a few seconds then assume ready
+            sleep 5
+            echo "servers_ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --- Browser test pass 1 ---
+      - name: Run browser tests (pass 1)
+        id: e2e_pass1
+        if: ${{ steps.e2e_servers.outputs.servers_ready == 'true' }}
+        continue-on-error: true
+        env:
+          VERITY_E2E_EMAIL: ${{ secrets.VERITY_E2E_EMAIL }}
+          VERITY_E2E_PASSWORD: ${{ secrets.VERITY_E2E_PASSWORD }}
+          VERITY_API_BASE: ${{ steps.e2e_cfg.outputs.base_url }}
+        run: |
+          export ${{ steps.e2e_cfg.outputs.base_url_env }}="${{ steps.e2e_cfg.outputs.base_url }}"
+          E2E_CMD="${{ steps.e2e_cfg.outputs.e2e_command }}"
+          set +e
+          bash -lc "$E2E_CMD" 2>&1 | tee e2e-error.txt
+          e2e_exit=${PIPESTATUS[0]}
+          set -e
+          if [ "$e2e_exit" -ne 0 ]; then
+            echo "e2e_failed=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "e2e_failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare Codex e2e fix prompt (attempt 1)
+        if: ${{ steps.e2e_pass1.outputs.e2e_failed == 'true' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Codex Browser Test Fix (Attempt 1 of 3)"
+            echo ""
+            echo "Playwright browser tests failed against the locally running app."
+            echo "Fix the source code or the test file so the tests pass."
+            echo ""
+            echo "### Rules:"
+            echo "- Read files BEFORE writing. Never overwrite with stale content."
+            echo "- Prefer fixing the source code over weakening the test."
+            echo "- If the test has a wrong selector or outdated assertion, fix the test."
+            echo ""
+            echo "## Playwright error output"
+            echo ""
+            cat e2e-error.txt
+          } > codex-e2e-fix-prompt.md
+
+      - name: Prepare Codex permission profile
+        shell: bash
+        run: |
+          # codex-action rewrites config.toml in CODEX_HOME to inject its proxy
+          # provider, so the profile is copied out of the checkout first.
+          mkdir -p "$RUNNER_TEMP/codex-home"
+          cp .github/codex/home/config.toml "$RUNNER_TEMP/codex-home/config.toml"
+          cp .github/codex/home/models.json "$RUNNER_TEMP/codex-home/models.json"
+
+      - name: Run Codex e2e fix (attempt 1)
+        if: ${{ steps.e2e_pass1.outputs.e2e_failed == 'true' }}
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 10
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          model: bluesky/auto
+          effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
+          prompt-file: codex-e2e-fix-prompt.md
+          output-file: codex-e2e-fix-output-1.md
+          sandbox: workspace-write
+
+      # --- Browser test pass 2 ---
+      - name: Run browser tests (pass 2)
+        id: e2e_pass2
+        if: ${{ steps.e2e_pass1.outputs.e2e_failed == 'true' }}
+        continue-on-error: true
+        env:
+          VERITY_E2E_EMAIL: ${{ secrets.VERITY_E2E_EMAIL }}
+          VERITY_E2E_PASSWORD: ${{ secrets.VERITY_E2E_PASSWORD }}
+          VERITY_API_BASE: ${{ steps.e2e_cfg.outputs.base_url }}
+        run: |
+          export ${{ steps.e2e_cfg.outputs.base_url_env }}="${{ steps.e2e_cfg.outputs.base_url }}"
+          E2E_CMD="${{ steps.e2e_cfg.outputs.e2e_command }}"
+          set +e
+          bash -lc "$E2E_CMD" 2>&1 | tee e2e-error.txt
+          e2e_exit=${PIPESTATUS[0]}
+          set -e
+          if [ "$e2e_exit" -ne 0 ]; then
+            echo "e2e_failed=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "e2e_failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare Codex e2e fix prompt (attempt 2)
+        if: ${{ steps.e2e_pass2.outputs.e2e_failed == 'true' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Codex Browser Test Fix (Attempt 2 of 3)"
+            echo ""
+            echo "Playwright browser tests STILL failing after first fix attempt."
+            echo "Read the error carefully. The previous fix may have been incomplete or wrong."
+            echo ""
+            echo "### Rules:"
+            echo "- Read files BEFORE writing."
+            echo "- Try a different approach than the first attempt."
+            echo "- Check if the app actually renders the expected content."
+            echo ""
+            echo "## Playwright error output"
+            echo ""
+            cat e2e-error.txt
+          } > codex-e2e-fix-prompt.md
+
+      - name: Prepare Codex permission profile
+        shell: bash
+        run: |
+          # codex-action rewrites config.toml in CODEX_HOME to inject its proxy
+          # provider, so the profile is copied out of the checkout first.
+          mkdir -p "$RUNNER_TEMP/codex-home"
+          cp .github/codex/home/config.toml "$RUNNER_TEMP/codex-home/config.toml"
+          cp .github/codex/home/models.json "$RUNNER_TEMP/codex-home/models.json"
+
+      - name: Run Codex e2e fix (attempt 2)
+        if: ${{ steps.e2e_pass2.outputs.e2e_failed == 'true' }}
+        uses: ./.github/actions/verity-codex-direct
+        timeout-minutes: 10
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          model: bluesky/auto
+          effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
+          prompt-file: codex-e2e-fix-prompt.md
+          output-file: codex-e2e-fix-output-2.md
+          sandbox: workspace-write
+
+      # --- Browser test pass 3 (final) ---
+      - name: Run browser tests (pass 3 - final)
+        id: e2e_pass3
+        if: ${{ steps.e2e_pass2.outputs.e2e_failed == 'true' }}
+        continue-on-error: true
+        env:
+          VERITY_E2E_EMAIL: ${{ secrets.VERITY_E2E_EMAIL }}
+          VERITY_E2E_PASSWORD: ${{ secrets.VERITY_E2E_PASSWORD }}
+          VERITY_API_BASE: ${{ steps.e2e_cfg.outputs.base_url }}
+        run: |
+          export ${{ steps.e2e_cfg.outputs.base_url_env }}="${{ steps.e2e_cfg.outputs.base_url }}"
+          E2E_CMD="${{ steps.e2e_cfg.outputs.e2e_command }}"
+          set +e
+          bash -lc "$E2E_CMD" 2>&1 | tee e2e-error.txt
+          e2e_exit=${PIPESTATUS[0]}
+          set -e
+          if [ "$e2e_exit" -ne 0 ]; then
+            echo "e2e_failed=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "e2e_failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --- Determine final e2e status ---
+      - name: Resolve browser test outcome
+        id: e2e_final
+        if: always()
+        run: |
+          # verity: explicit-browser-outcomes
+          status=failed
+          if [ "${{ steps.e2e_cfg.outputs.runnable }}" != "true" ] || [ "${{ steps.e2e_servers.outputs.servers_ready }}" != "true" ]; then
+            status=skipped
+          else
+            for attempt in "${{ steps.e2e_pass3.outcome }}:${{ steps.e2e_pass3.outputs.e2e_failed }}" "${{ steps.e2e_pass2.outcome }}:${{ steps.e2e_pass2.outputs.e2e_failed }}" "${{ steps.e2e_pass1.outcome }}:${{ steps.e2e_pass1.outputs.e2e_failed }}"; do
+              case "$attempt" in
+                :|skipped:*) continue ;;
+                success:false) status=passed; break ;;
+                *) status=failed; break ;;
+              esac
+            done
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Report stage - browser tests
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          VERITY_DELIVERY_ID: ${{ steps.run_ctx.outputs.verity_delivery_id }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          STAGE: verify.e2e
+          STAGE_STATUS: ${{ steps.e2e_final.outputs.status }}
+        run: python scripts/verity_report_stage.py
+
+      - name: Stop local servers
+        if: always()
+        run: |
+          if [ -f /tmp/e2e-server.pid ]; then
+            kill "$(cat /tmp/e2e-server.pid)" 2>/dev/null || true
+          fi
+          # Fallback: kill common dev server processes
+          pkill -f "next dev" 2>/dev/null || true
+          pkill -f "ts-node-dev" 2>/dev/null || true
+          pkill -f "vite" 2>/dev/null || true
+          pkill -f "webpack-dev-server" 2>/dev/null || true
+          pkill -f "nodemon" 2>/dev/null || true
+
+      # â”€â”€â”€ END LAYER 1 â”€â”€â”€
+
+      # â”€â”€â”€ Capture passing E2E specs for test case library â”€â”€â”€
+      - name: Collect passing E2E spec files
+        id: e2e_specs
+        if: ${{ steps.e2e_final.outputs.status == 'passed' }}
+        run: |
+          specs_json=$(python3 - <<'PY'
+          import json, glob
+          specs = []
+          for pattern in ["**/e2e/**/*.spec.ts", "**/e2e/**/*.spec.js", "**/tests/e2e/**/*.spec.ts"]:
+            for path in sorted(glob.glob(pattern, recursive=True)):
+              if "node_modules" in path:
+                continue
+              try:
+                content = open(path, encoding="utf-8").read()
+                if len(content.strip()) > 50:
+                  specs.append({"path": path, "content": content[:50000]})
+              except Exception:
+                pass
+          seen = set()
+          unique = []
+          for s in specs:
+            if s["path"] not in seen:
+              seen.add(s["path"])
+              unique.append(s)
+          print(json.dumps(unique))
+          PY
+          )
+          echo "$specs_json" > /tmp/e2e-spec-files.json
+          count=$(echo "$specs_json" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Collected $count E2E spec file(s) for test case capture"
+
+      - name: Upload artifacts (before cleanup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-codex-dev-cycle
+          path: |
+            codex-prompt.md
+            codex-output.md
+            codex-fix-prompt.md
+            codex-fix-output.md
+            codex-test-fix-prompt.md
+            codex-test-fix-output.md
+            codex-e2e-fix-prompt.md
+            codex-e2e-fix-output-1.md
+            codex-e2e-fix-output-2.md
+            build-error.txt
+            test-error.txt
+            e2e-error.txt
+            issue_context.md
+            .verity/resolved_commands.json
+          if-no-files-found: ignore
+
+      - name: Clean generated artifacts before PR
+        run: |
+          set -euo pipefail
+          find . -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find . -type f -name '*.pyc' -delete
+          rm -f codex-prompt.md codex-output.md codex-fix-prompt.md codex-fix-output.md \
+                codex-test-fix-prompt.md codex-test-fix-output.md \
+                codex-e2e-fix-prompt.md codex-e2e-fix-output-1.md codex-e2e-fix-output-2.md \
+                test-error.txt e2e-error.txt build-error.txt issue_context.md pr-body.md \
+                .verity/resolved_commands.json
+          rm -rf frontend/node_modules/.vite frontend/node_modules/.vite-* frontend/.vite
+          # `docs/REPO_CONTEXT.md` and `docs/AI_HANDOFF.md` are deliberately NOT
+          # restored here. This step used to drop them "to avoid noisy diffs",
+          # which undid the `Sync docs context` step earlier in this same job and
+          # shipped a PR whose docs no longer described the tree it changed.
+          # `verity-auto-docs` then re-ran the same generator on that PR, saw the
+          # diff this line had discarded, and failed the check — so every
+          # dev-cycle PR that touched the repo layout was born red. The generated
+          # docs travel with the change that caused them.
+
+      - name: Guard against docs-only PRs
+        env:
+          ALLOW_DOCS_ONLY_PR: ${{ steps.run_ctx.outputs.allow_docs_only_pr }}
+        run: |
+          set -euo pipefail
+          changed_files="$(git diff --name-only HEAD || true)"
+          if [ -z "$changed_files" ]; then
+            echo "No changes detected; skipping docs-only guard."
+            exit 0
+          fi
+          non_docs="$(
+            printf '%s\n' "$changed_files" | grep -Ev '(^docs/|^README\.md$|^CHANGELOG\.md$|^LICENSE$|^AGENTS\.md$|^\.github/codex/prompts/|^\.github/codex/schemas/|\.md$)' || true
+          )"
+          if [ -n "$non_docs" ]; then
+            echo "Non-doc changes detected; continuing."
+            exit 0
+          fi
+          if [ "${ALLOW_DOCS_ONLY_PR}" = "true" ]; then
+            echo "Only docs changed, but allow_docs_only_pr=true so continuing."
+            exit 0
+          fi
+          echo "Docs-only change set detected. Set allow_docs_only_pr=true for documentation-only runs." >&2
+          exit 1
+
+      - name: Prepare PR body
+        env:
+          CODEX_SUMMARY: ${{ steps.run_codex.outputs.final-message }}
+          E2E_STATUS: ${{ steps.e2e_final.outputs.status }}
+        run: |
+          set -euo pipefail
+          {
+            echo "This PR was created automatically by Verity/Codex."
+            echo ""
+            echo "- Workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            # `Closes #N`, not the bare "- Issue: N" this used to print. That
+            # line was text: GitHub never linked the two, so merging this pull
+            # request closed nothing, and every tenant accumulated one open
+            # issue per requirement Verity had already delivered. Verity closes
+            # it explicitly as well — the keyword only fires for a merge into
+            # the default branch — but the link belongs in the pull request
+            # too, where a reviewer can see what it is for.
+            if [ -n "${{ inputs.issue_number }}" ] && [ "${{ inputs.issue_number }}" != "0" ]; then
+              echo "- Closes #${{ inputs.issue_number }}"
+            fi
+            echo ""
+            echo "## Browser test status"
+            echo ""
+            if [ "${E2E_STATUS}" = "failed" ]; then
+              echo "> **Browser tests failed**: Playwright e2e tests did not pass after 3 Codex fix attempts. Please review the e2e failures in the workflow artifacts."
+            elif [ "${E2E_STATUS}" = "passed" ]; then
+              echo "> **Browser tests passed**: Playwright e2e tests passed successfully."
+            elif [ "${E2E_STATUS}" = "skipped" ]; then
+              echo "> **Browser tests skipped**: Local servers could not start or Playwright was not available."
+            fi
+            echo ""
+            echo "## Codex summary"
+            echo ""
+            printf '%s\n' "${CODEX_SUMMARY}"
+          # Written outside the repo on purpose. While this lived at the repo
+          # root the `git add -A` that stages the run's work swept it into the
+          # commit, so every dev-cycle PR shipped a `pr-body.md` containing its
+          # own description as a tracked file.
+          } > /tmp/pr-body.md
+
+      # Codex runs with workspace-write, which lets it execute shell commands,
+      # not just edit files. A `git checkout`/`reset`/`commit` inside its
+      # sandbox — accidental or otherwise — would move HEAD out from under
+      # Verity, and the next step would then check out its new branch and
+      # commit on top of that moved state without anyone noticing. This
+      # `workflow_dispatch` job checks out detached, so `expected_branch` is
+      # always empty and the real guarantee is the HEAD SHA comparison; the
+      # branch check is kept so this same guard still means something if the
+      # trigger model ever checks out a named branch. This must run after
+      # every Codex invocation in the job (main pass, test-fix, build-fix,
+      # all three e2e-fix attempts) and before the first git command Verity
+      # itself issues below.
+      - name: Verify Codex did not move Git HEAD or branch
+        if: ${{ steps.pr_gate.outputs.allowed == 'true' }}
+        env:
+          EXPECTED_BRANCH: ${{ steps.git_state.outputs.expected_branch }}
+          EXPECTED_HEAD: ${{ steps.git_state.outputs.expected_head }}
+        run: |
+          set -euo pipefail
+          actual_branch="$(git branch --show-current)"
+          actual_head="$(git rev-parse HEAD)"
+          if [ "$actual_branch" != "$EXPECTED_BRANCH" ] || [ "$actual_head" != "$EXPECTED_HEAD" ]; then
+            echo "::error::Git HEAD/branch changed during this run. Expected branch '$EXPECTED_BRANCH' at $EXPECTED_HEAD, found branch '$actual_branch' at $actual_head. Verity only trusts working-tree edits from Codex, never a moved checkpoint; refusing to commit or push on top of this state."
+            exit 1
+          fi
+
+      # Resolved once so the PR step and the completion callback cannot disagree
+      # about which branch this run produced.
+      - name: Resolve PR branch name
+        id: pr_branch
+        if: ${{ steps.pr_gate.outputs.allowed == 'true' }}
+        env:
+          BRANCH: ${{ inputs.branch_name != '' && inputs.branch_name || (inputs.issue_number != '' && format('verity/codex-dev-cycle-{0}', inputs.issue_number) || format('verity/codex-dev-cycle-{0}', github.run_id)) }}
+        run: echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      # Push only — this run never asks GitHub for a pull request.
+      #
+      # Opening one from here needs "Allow GitHub Actions to create and approve
+      # pull requests", which is off by default and which Verity can neither
+      # read nor change. Pushing needs only `contents: write`, which this
+      # workflow always has, so the branch goes up, `Notify Verity - completed`
+      # reports it as `pr_branch`, and Verity opens the PR from its installation
+      # token — see `ensureDevCyclePullRequest`. The run therefore stays green
+      # on a setting it has no business depending on, and because an App-opened
+      # PR triggers `pull_request` workflows where a `GITHUB_TOKEN`-opened one
+      # does not, `codex-pr-review` and the guardrails actually run on it.
+      #
+      # Everything that used to hang off the PR-creating step — the issue
+      # comment, enabling auto-merge — now happens in the same backend handler
+      # that opens the PR, because only it knows the PR number.
+      - name: Push branch for Verity to open a PR from
+        id: push_branch
+        if: ${{ steps.pr_gate.outputs.allowed == 'true' }}
+        env:
+          BRANCH: ${{ steps.pr_branch.outputs.name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Codex produced no changes; nothing to push."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          # `git status` above can report changes that stage to nothing (mode
+          # bits, ignored paths). Committing then would abort the run on a
+          # non-failure.
+          if git diff --cached --quiet; then
+            echo "Nothing staged after add; nothing to push."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "chore(verity): codex dev-cycle changes"
+          # The branch name is deliberately stable (see `Resolve PR branch
+          # name`), so a re-dispatch lands on a branch that already exists and
+          # already has an open PR. This run rebuilt its work from the default
+          # branch, so the remote branch is replaced rather than appended to —
+          # which is what the previous PR action did too. The lease is what
+          # keeps that from silently discarding a commit someone else pushed
+          # onto the branch in the meantime; it needs a remote-tracking ref to
+          # compare against, hence the fetch.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            git push --force-with-lease origin "$BRANCH"
+          else
+            git push origin "$BRANCH"
+          fi
+          # The PR head SHA is what release candidates bind to. Taking it from
+          # the commit this run just made is exact; `github.sha` is the default
+          # branch this run started from and would bind a release to the wrong
+          # commit entirely.
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Report stage - package
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          VERITY_DELIVERY_ID: ${{ steps.run_ctx.outputs.verity_delivery_id }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          STAGE: package
+          STAGE_STATUS: ${{ steps.push_branch.outputs.pushed == 'true' && 'success' || 'skipped' }}
+        run: python scripts/verity_report_stage.py
+
+      - name: Notify Verity - completed
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          JOB_STATUS: ${{ job.status }}
+          # Only set once the branch is actually on the remote. Reporting it
+          # otherwise would have Verity try to open a PR from a ref that does
+          # not exist.
+          PR_BRANCH: ${{ steps.push_branch.outputs.pushed == 'true' && steps.pr_branch.outputs.name || '' }}
+          # Everything the PR itself needs, since the backend is what opens it.
+          PR_LABELS: ${{ steps.e2e_final.outputs.status == 'failed' && format('{0},verity:e2e-failed', steps.run_ctx.outputs.pr_labels) || steps.run_ctx.outputs.pr_labels }}
+          PR_TITLE: ${{ steps.run_ctx.outputs.pr_title != '' && steps.run_ctx.outputs.pr_title || format('Verity Codex dev-cycle (run {0})', github.run_id) }}
+          PR_DRAFT: ${{ steps.run_ctx.outputs.pr_draft }}
+          AUTO_MERGE: ${{ steps.run_ctx.outputs.auto_merge }}
+          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
+          # Reported back to Verity, so it must name what actually ran.
+          CODEX_MODEL: bluesky/auto
+          # The Codex action exposes exactly one output, `final-message`.
+          # These read token counts it has never emitted, so actualInputTokens,
+          # actualOutputTokens and actualTotalTokens have been null on every
+          # dev-cycle callback. Left unset rather than faked: a null cost is
+          # honest, an invented one is not. Restore only if the action starts
+          # publishing usage outputs.
+          CODEX_INPUT_USD_PER_1M: ${{ vars.VERITY_CODEX_INPUT_USD_PER_1M }}
+          CODEX_OUTPUT_USD_PER_1M: ${{ vars.VERITY_CODEX_OUTPUT_USD_PER_1M }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          HEAD_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ steps.push_branch.outputs.head_sha }}
+          E2E_SPECS_COUNT: ${{ steps.e2e_specs.outputs.count || '0' }}
+          E2E_STATUS: ${{ steps.e2e_final.outputs.status || '' }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          SESSION_ID: ${{ inputs.session_id }}
+          SESSION_TITLE: ${{ steps.run_ctx.outputs.session_title }}
+          ATTEMPT_ID: ${{ steps.run_ctx.outputs.attempt_id }}
+          SESSION_BRANCH: ${{ inputs.branch_name }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          VERITY_DELIVERY_ID: ${{ steps.run_ctx.outputs.verity_delivery_id }}
+        run: |
+          # Bootstrap substitutes the callback-URL placeholder everywhere in this file,
+          # including inside any equality check written against it — which turned this
+          # guard into "real URL equals real URL", skipping every callback while still
+          # exiting 0, so the step stayed green and Verity heard nothing. An
+          # unsubstituted placeholder has no URL scheme; test for that instead.
+          case "$VERITY_CALLBACK_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "Skipping callback: callback URL not configured"
+              exit 0
+              ;;
+          esac
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os, pathlib
+          def parse_number(value):
+            try:
+              if value is None or str(value).strip() == "":
+                return None
+              return float(value)
+            except Exception:
+              return None
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            # See the "started" callback above for why this is a literal, not GITHUB_WORKFLOW.
+            "workflow": "codex-dev-cycle.yml",
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": os.environ.get("JOB_STATUS"),
+            # This run pushes a branch and stops. `pr_branch` is the handoff:
+            # Verity opens the pull request from its installation token, so
+            # there is no `pr_number` to report from here, and everything the
+            # PR needs to be built correctly travels with it.
+            "pr_branch": os.environ.get("PR_BRANCH") or None,
+            "pr_labels": os.environ.get("PR_LABELS") or None,
+            "pr_title": os.environ.get("PR_TITLE") or None,
+            "pr_body": (pathlib.Path("/tmp/pr-body.md").read_text(encoding="utf-8")[:60000]
+                        if pathlib.Path("/tmp/pr-body.md").exists() else None),
+            "pr_draft": (os.environ.get("PR_DRAFT") or "").strip().lower() == "true",
+            "auto_merge": (os.environ.get("AUTO_MERGE") or "").strip().lower() == "true",
+            "codex_final_message": (os.environ.get("CODEX_FINAL_MESSAGE") or "")[:20000],
+            "branch": os.environ.get("SESSION_BRANCH") or os.environ.get("BRANCH_NAME") or None,
+            "sha": os.environ.get("HEAD_SHA") or None,
+            "pr_head_sha": os.environ.get("PR_HEAD_SHA") or None,
+            "issue_number": os.environ.get("ISSUE_NUMBER") or None,
+            "e2e_status": os.environ.get("E2E_STATUS") or None,
+            "session_id": os.environ.get("SESSION_ID") or None,
+            "session_title": os.environ.get("SESSION_TITLE") or None,
+            "attempt_id": os.environ.get("ATTEMPT_ID") or None,
+            # Only this id lets Verity tell the run holding the requirement's
+            # lock apart from the three test-generation runs beside it, which
+            # finish in about three minutes while this one still has half an
+            # hour to go.
+            "verity_delivery_id": os.environ.get("VERITY_DELIVERY_ID") or None,
+            "dispatch_id": os.environ.get("DISPATCH_ID") or None,
+            "model": os.environ.get("CODEX_MODEL") or None,
+            "token_usage": {
+              "model": os.environ.get("CODEX_MODEL") or None,
+              "actualInputTokens": parse_number(os.environ.get("CODEX_ACTUAL_INPUT_TOKENS")),
+              "actualOutputTokens": parse_number(os.environ.get("CODEX_ACTUAL_OUTPUT_TOKENS")),
+              "actualTotalTokens": parse_number(os.environ.get("CODEX_ACTUAL_TOTAL_TOKENS")),
+              "inputUsdPerMillion": parse_number(os.environ.get("CODEX_INPUT_USD_PER_1M")),
+              "outputUsdPerMillion": parse_number(os.environ.get("CODEX_OUTPUT_USD_PER_1M")),
+              "pricingSource": "repo variables VERITY_CODEX_INPUT_USD_PER_1M / VERITY_CODEX_OUTPUT_USD_PER_1M" if os.environ.get("CODEX_INPUT_USD_PER_1M") or os.environ.get("CODEX_OUTPUT_USD_PER_1M") else None,
+            },
+            "run_correlation_id": f"{os.environ.get('GITHUB_WORKFLOW')}:{os.environ.get('GITHUB_RUN_ID')}:{os.environ.get('GITHUB_RUN_ATTEMPT')}"
+          }
+          specs_count = int(os.environ.get("E2E_SPECS_COUNT") or "0")
+          specs_path = pathlib.Path("/tmp/e2e-spec-files.json")
+          if specs_count > 0 and specs_path.exists():
+            try:
+              specs = json.loads(specs_path.read_text(encoding="utf-8"))
+              if specs:
+                payload["e2e_spec_files"] = specs
+            except Exception:
+              pass
+          print(json.dumps(payload))
+          PY
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true

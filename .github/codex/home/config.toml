@@ -1,0 +1,74 @@
+# Trusted Codex configuration for Verity's CI agents.
+#
+# Why this file exists
+# --------------------
+# openai/codex-action v1.12 added `sandbox_workspace_write` to the set of
+# config roots that `codex-args` may not override while a protected
+# `safety-strategy` is in effect. The old
+# `--config sandbox_workspace_write.network_access=true` therefore aborts the
+# run before Codex starts. Network access now has to come from a permission
+# profile, and the built-in `:workspace` profile deliberately grants none.
+#
+# `verity-ci` is `:workspace` (write access to the checkout) plus unrestricted
+# network, which is what the previous legacy-sandbox setup granted. CI agents
+# need the network to install dependencies and run the test suite.
+#
+# How it is used
+# --------------
+# Workflows copy this file to $RUNNER_TEMP/codex-home and point the action's
+# `codex-home` input at that copy. The action appends its Responses API proxy
+# provider to the copy, which is why the original must not be handed to it
+# directly - it would dirty the checkout that the agent then commits.
+#
+# Security note: permission profiles are NOT sanitized by the action's
+# `codex-args` validation. This file is trusted workflow configuration and must
+# never be sourced from an untrusted checkout (e.g. a fork's PR head).
+
+# The model catalogue Codex reads instead of its bundled one.
+#
+# It exists for one field. `apply_patch` is offered to the model only when
+# `apply_patch_tool_type` is set, and Codex can only ever offer it as a
+# `type: "custom"` tool with a lark grammar — `ApplyPatchToolType` has a single
+# variant, `Freeform`. Multra never delivers that tool: replaying a captured
+# request shows the model calling `exec_command` twenty times and the custom
+# tool not once, on `/v1/responses` and `/v1/context/responses` alike.
+#
+# Codex's own instructions meanwhile say "Use `apply_patch` for manual code
+# edits. Do not create or edit files with `cat` or other shell write tricks."
+# So the model was told to use a tool it could not call and forbidden the
+# obvious alternative. It did the only thing left: wrote the diff into its
+# answer, and when pushed, `cat`-ed it into
+# `backend/src/http/routes/leads.ts.patch` — a pull request that claimed a
+# feature and contained a text file.
+#
+# Setting the field to null removes the tool. `apply_patch` is still a command
+# on PATH, so the instruction stays true and the model reaches it through the
+# shell — which is how the v2 dev cycle shipped features for months
+# (`bash -lc "apply_patch <<'PATCH' … PATCH"`, succeeded in 3294ms).
+#
+# The entry is copied from Codex 0.153.4's own bundled catalogue so its shape
+# is exactly what that version deserializes. Re-copy it when the pinned
+# codex-action version changes.
+#
+# Two further fields are set against that copy, because it is Codex's `gpt-5.5`
+# row and Multra rejects two things that row advertises. Replaying a captured
+# request isolated both: `text: {verbosity}` (from `support_verbosity`) and a
+# `type: "tool_search"` tool (from `supports_search_tool` - `spec_plan.rs`
+# gates it on `model_info.supports_search_tool && namespace_tools_enabled`).
+# Each returns 400 on its own, so removing one alone changes nothing visible.
+model_catalog_json = "models.json"
+#
+# Placed above every table on purpose. TOML assigns a bare key to whichever
+# table header precedes it, and this sat at the end of the file after
+# `[permissions.verity-ci.network]` — so it parsed as
+# `permissions.verity-ci.network.model_catalog_json`, Codex never saw it, and
+# every run kept warning "Model metadata for `bluesky/auto` not found.
+# Defaulting to fallback metadata". The file was valid TOML and silently meant
+# something else.
+
+[permissions.verity-ci]
+description = "Workspace writes plus network access for Verity CI agents."
+extends = ":workspace"
+
+[permissions.verity-ci.network]
+enabled = true

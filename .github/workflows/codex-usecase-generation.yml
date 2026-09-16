@@ -1,0 +1,936 @@
+name: Verity Codex Use-Case Generation
+# The dispatch id has to reach the run's title.
+#
+# Verity correlates a dispatch to its GitHub run by looking for this id in the
+# run's display title — that is the only exact link between the two, because a
+# workflow_dispatch response carries no run id. Without it the match falls back
+# to a time window, and when that cannot decide, the tracked record never learns
+# its run id at all: the webhook then writes the outcome to a second record and
+# the one being watched sits at "queued" forever.
+#
+# Seen live on the use-case run: it failed in seconds and the screen watching it
+# was still counting up a minute later.
+run-name: >-
+  Verity Codex Use-Case Generation${{ inputs.dispatch_id != '' && format(' · {0}', inputs.dispatch_id) || '' }}
+
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Optional scope (e.g., 'checkout journey')"
+        required: false
+        default: ""
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+      enable_pr_creation:
+        description: "Explicitly allow this run to create/update a PR (true/false)"
+        required: true
+        default: "false"
+      dispatch_id:
+        description: "Verity-internal correlation id for this dispatch attempt (optional)"
+        required: false
+        default: ""
+      known_generated:
+        description: "Whether Verity has a prior successful generation run for this repo (true/false)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: verity-usecase-generation-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  usecases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}" ]; then
+            echo "Missing required secret MULTRA_API_KEY or BLUESKY_API_KEY" >&2
+            exit 1
+          fi
+          if [ -z "${{ secrets.VERITY_PROJECT_TOKEN }}" ]; then
+            echo "Missing required secret VERITY_PROJECT_TOKEN" >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          cfg = yaml.safe_load(Path('.verity/config.yml').read_text()) or {}
+          verity = cfg.get('verity', {}) or {}
+          automation = cfg.get('automation', {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+          max_stories = int(verity.get('max_generated_stories', 500))
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out, 'a', encoding='utf-8') as f:
+            f.write(f"project_id={project_override or str(verity.get('project_id', '')).strip()}\n")
+            f.write(f"callback_url={callback_override or str(verity.get('callback_url', '')).strip()}\n")
+            f.write(f"max_generated_stories={max_stories}\n")
+            f.write(f"automation_paused={'true' if automation.get('paused') else 'false'}\n")
+            f.write(f"auto_create_pr_enabled={'true' if automation.get('auto_create_pr') else 'false'}\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Notify Verity - started
+        # Deliberately NOT continue-on-error. This step is the run's only
+        # handshake with Verity: if it is refused, nothing this job produces can
+        # be saved, and continuing just burns twenty minutes of Codex to fill a
+        # dialog that will wait for a result forever. A network blip still gets
+        # a non-2xx and stops the run, which is the safe direction to fail.
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          KNOWN_GENERATED: ${{ inputs.known_generated }}
+        run: |
+          # Bootstrap substitutes the callback-URL placeholder everywhere in this file,
+          # including inside any equality check written against it — which turned this
+          # guard into "real URL equals real URL", skipping every callback while still
+          # exiting 0, so the step stayed green and Verity heard nothing. An
+          # unsubstituted placeholder has no URL scheme; test for that instead.
+          case "$VERITY_CALLBACK_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "Skipping callback: callback URL not configured"
+              exit 0
+              ;;
+          esac
+          python - <<'PY' | curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @- \
+            -o /tmp/verity-callback-body.txt \
+            -w '%{http_code}' > /tmp/verity-callback-status.txt || echo 000 > /tmp/verity-callback-status.txt
+          import json, os
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            # The filename Verity's dispatcher keys its tracking record by.
+            # GITHUB_WORKFLOW is this workflow's display name ("Verity Codex Use-Case
+            # Generation"), which never matches that key, so every dispatch-time record
+            # was orphaned from its completion-time counterpart.
+            "workflow": "codex-usecase-generation.yml",
+            # Minted by Verity at dispatch and echoed back here, so the queued record
+            # this run belongs to is updated in place rather than duplicated under
+            # GitHub's real run id.
+            "dispatch_id": os.environ.get("DISPATCH_ID") or None,
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            # Whether this run treats docs/use-cases.md as Verity's own prior output (safe to
+            # regenerate fresh) or a possible human original (merge, don't overwrite) — see
+            # usecase-generation.md Step 0, item 5. Carried in the callback (in addition to the
+            # workflow_dispatch inputs GitHub records) so it's debuggable from either side.
+            "known_generated": os.environ.get("KNOWN_GENERATED", "false").strip().lower() == "true",
+          }
+          print(json.dumps(payload))
+          PY
+
+          # A rejected callback used to be invisible: `curl -sS` does not fail on
+          # 4xx and nothing read the response, so a stale VERITY_PROJECT_TOKEN
+          # produced a green step, a run that did all its work, and a "Study my
+          # project" dialog that waited on a result the backend had already
+          # thrown away. Fail here instead — before spending twenty minutes of
+          # Codex on results that cannot be delivered.
+          status=$(cat /tmp/verity-callback-status.txt 2>/dev/null || echo 000)
+          case "$status" in
+            2*) echo "[callback] Verity accepted the start callback (HTTP $status)" ;;
+            401|403)
+              echo "::error::Verity rejected this repository's callback token (HTTP $status). VERITY_PROJECT_TOKEN does not match the project in .verity/config.yml, so no result from this run could be saved. Re-save the project's GitHub secrets from Verity, then run this again." >&2
+              cat /tmp/verity-callback-body.txt 2>/dev/null >&2 || true
+              exit 1
+              ;;
+            *)
+              echo "::error::Verity did not accept the start callback (HTTP $status). Nothing this run produces would be saved, so it is stopping now." >&2
+              cat /tmp/verity-callback-body.txt 2>/dev/null >&2 || true
+              exit 1
+              ;;
+          esac
+
+      - name: Install ast-grep
+        continue-on-error: true
+        run: |
+          npm install -g @ast-grep/cli 2>/dev/null \
+            || echo "ast-grep not available â€” using regex fallback"
+
+      - name: Extract code inventory (Pass 1)
+        run: python scripts/extract-code-inventory.py
+        continue-on-error: true
+
+      - name: Trace user flows (Pass 2-3)
+        run: python scripts/trace-flows.py
+        continue-on-error: true
+
+      - name: Mine test requirements (Pass 4)
+        run: python scripts/mine-tests.py
+        continue-on-error: true
+
+      - name: Render prompt
+        env:
+          SCOPE: ${{ inputs.scope }}
+        run: |
+          cat .github/codex/prompts/usecase-generation.md > codex-prompt.md
+          if [ -f "code-inventory.md" ]; then
+            echo "" >> codex-prompt.md
+            echo "## Pre-Extracted Code Inventory" >> codex-prompt.md
+            echo "" >> codex-prompt.md
+            echo "The file \`code-inventory.md\` in the repo root contains a pre-extracted inventory" >> codex-prompt.md
+            echo "of all API endpoints, frontend pages, test behaviors, UI interactions, and" >> codex-prompt.md
+            echo "frontend API calls found in this codebase. **Read it FIRST** before scanning" >> codex-prompt.md
+            echo "the code yourself. Use it to ensure you cover ALL features, not just the" >> codex-prompt.md
+            echo "obvious ones." >> codex-prompt.md
+          fi
+          # `scope` is user text (a requirement's title/description). It travels
+          # as an environment variable because the runner substitutes
+          # a workflow expression before the shell parses the line — inline, a backtick
+          # or a `$(` in a requirement title would execute.
+          if [ -n "${SCOPE:-}" ]; then
+            {
+              echo ""
+              echo "## Scope"
+              echo ""
+              printf '%s\n' "$SCOPE"
+            } >> codex-prompt.md
+          fi
+          # known_generated distinguishes "Verity's own prior output, safe to regenerate fresh"
+          # from "possibly a human-authored docs/use-cases.md, merge instead of overwrite" — see
+          # usecase-generation.md Step 0, item 5. Logged here (and in the started callback above)
+          # so a run's inputs/logs make the mode it used debuggable after the fact.
+          KNOWN_GENERATED="${{ inputs.known_generated == 'true' && 'true' || 'false' }}"
+          echo "[verity] known_generated=$KNOWN_GENERATED" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> codex-prompt.md
+          echo "## Known-Generated Status" >> codex-prompt.md
+          echo "" >> codex-prompt.md
+          echo "known_generated: $KNOWN_GENERATED" >> codex-prompt.md
+
+      - name: Prepare Codex permission profile
+        shell: bash
+        run: |
+          # codex-action rewrites config.toml in CODEX_HOME to inject its proxy
+          # provider, so the profile is copied out of the checkout first.
+          mkdir -p "$RUNNER_TEMP/codex-home"
+          cp .github/codex/home/config.toml "$RUNNER_TEMP/codex-home/config.toml"
+          cp .github/codex/home/models.json "$RUNNER_TEMP/codex-home/models.json"
+
+      - name: Run Codex
+        id: run_codex
+        uses: ./.github/actions/verity-codex-direct
+        # 15 was not enough to read a large repository. An unscoped study of a
+        # documentation-heavy project spent 14m41s and was killed mid-read, so
+        # the run produced no requirement at all — the whole budget spent for
+        # nothing. Still inside the job's 30, which leaves headroom for checkout
+        # and the callback steps after this one.
+        timeout-minutes: 20
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          model: bluesky/auto
+          effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
+          prompt-file: codex-prompt.md
+          output-file: codex-output.md
+          sandbox: workspace-write
+
+      # Codex reporting a write it never performed is this job's dominant
+      # failure: five consecutive runs ended with "I wrote them to
+      # docs/use-cases.md" and an untouched 63-byte stub on disk. The guard at
+      # the end of this job already detected that perfectly — and then gave up,
+      # so a human had to notice and re-run by hand. Detecting it is worth
+      # nothing if the job does not then act on it.
+      #
+      # One retry, with the disk state quoted back so the model cannot repeat
+      # the claim, and with everything that exhausted the first attempt's
+      # context removed from the instructions.
+      - name: Check whether Codex actually wrote stories
+        id: wrote_check
+        run: |
+          count=$(grep -c "^### " docs/use-cases.md 2>/dev/null || echo 0)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" = "0" ]; then
+            echo "::warning::Codex reported success but docs/use-cases.md has no ### stories. Retrying once."
+            echo "retry=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "retry=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "[verity] stories after first attempt: $count" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Render retry prompt
+        if: steps.wrote_check.outputs.retry == 'true'
+        run: |
+          {
+            echo "# Retry: the file was not written"
+            echo
+            echo "You have already been asked to do this once. You replied that you had written"
+            echo "the user stories to docs/use-cases.md. That did not happen — the file on disk is"
+            echo "unchanged and contains zero \`### \` headings. This is the current, complete"
+            echo "content of docs/use-cases.md:"
+            echo
+            echo '```'
+            cat docs/use-cases.md 2>/dev/null || echo "(file does not exist)"
+            echo '```'
+            echo
+            echo "Do not search the repository at all on this attempt. Do not run rg or grep."
+            echo "Read code-inventory.md, then immediately use your file-editing tool to write"
+            echo "docs/use-cases.md. Write the file FIRST and refine it afterwards if budget"
+            echo "remains — an unfinished file that exists is worth more than a complete one you"
+            echo "only described."
+            echo
+            echo "Your final message must not claim a write. It must quote the first two lines of"
+            echo "docs/use-cases.md as they now stand on disk."
+            echo
+            cat codex-prompt.md
+          } > codex-retry-prompt.md
+          echo "[verity] retry prompt rendered" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run Codex (retry after empty write)
+        id: run_codex_retry
+        if: steps.wrote_check.outputs.retry == 'true'
+        uses: ./.github/actions/verity-codex-direct
+        # Shorter than the first attempt: this one is told not to search, so it
+        # should be writing almost immediately, and the job's 30-minute budget
+        # still has to cover the callback and PR steps after it.
+        timeout-minutes: 12
+        with:
+          multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
+          model: bluesky/auto
+          effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
+          prompt-file: codex-retry-prompt.md
+          output-file: codex-retry-output.md
+          sandbox: workspace-write
+
+      - name: Report retry outcome
+        if: steps.wrote_check.outputs.retry == 'true'
+        run: |
+          count=$(grep -c "^### " docs/use-cases.md 2>/dev/null || echo 0)
+          echo "[verity] stories after retry: $count" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$count" = "0" ]; then
+            echo "::warning::Retry also wrote nothing to docs/use-cases.md."
+          else
+            echo "::notice::Retry recovered the run: $count stories written after the first attempt wrote none."
+          fi
+
+      - name: Sync docs context (auto document mode)
+        run: python scripts/sync_repo_docs.py
+
+      # The product-grounding description Codex writes into README.md/docs/REPO_CONTEXT.md
+      # (Step 0 of the prompt) must survive past this one run, or every future scan silently
+      # redoes — and re-costs — the same understanding work.
+      #
+      # `peter-evans/create-pull-request` (used below for the docs/use-cases.md PR) depends on
+      # "Allow GitHub Actions to create and approve pull requests" being enabled in the
+      # customer's repo settings — off by default, unreadable/unsettable by Verity, and nothing
+      # in onboarding asks for it. So this step only pushes the branch; Verity's own GitHub App
+      # installation token (not subject to that restriction) opens the PR from the
+      # `grounding_pr_branch` reported in the completed callback below — the same rescue path
+      # `ensureDevCyclePullRequest` already provides for codex-dev-cycle and test-generation runs
+      # (see backend/services/githubApp.ts). That path is independent of, and not gated behind,
+      # `enable_pr_creation`/`auto_create_pr` further down: those gate the full, AI-authored
+      # docs/use-cases.md Requirement set, not this small, docs-only diff — but it still honors
+      # automation.paused, since a full pause means no PRs of any kind, not just the gated one.
+      #
+      # Committed via plumbing (write-tree/commit-tree) instead of `git checkout -b`, so HEAD
+      # never moves: the docs/use-cases.md PR step further down still bases off the checked-out
+      # ref, and the working copies of these two files are reset back to HEAD afterwards so that
+      # step's (unfiltered) diff doesn't also pick them up and duplicate them into that PR.
+      - name: Push grounding docs branch
+        id: grounding_branch
+        if: ${{ steps.cfg.outputs.automation_paused != 'true' }}
+        run: |
+          set -euo pipefail
+          # `git status --porcelain` (not `git diff`) so a brand-new README.md/REPO_CONTEXT.md
+          # that Codex just created — untracked, not merely modified — still counts as a change.
+          CHANGED=()
+          for f in README.md docs/REPO_CONTEXT.md; do
+            if [ -n "$(git status --porcelain -- "$f" 2>/dev/null)" ]; then
+              CHANGED+=("$f")
+            fi
+          done
+          if [ "${#CHANGED[@]}" -eq 0 ]; then
+            echo "No grounding-docs changes to persist; skipping."
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # One branch, not one per run. This used to embed ${{ github.run_id }},
+          # which made every scan push a branch nothing had seen before — and
+          # Verity opens the PR by looking for an *open PR on that branch*, so it
+          # never found the previous one and opened another. The PRs are
+          # identical in title and near-identical in content, and they
+          # accumulate: one per scan, forever.
+          #
+          # This branch is a rolling pointer at "the product grounding as of the
+          # last scan", so re-pushing it updates the single open PR instead of
+          # forking a new one. The bootstrap PR already works this way, with a
+          # branch keyed on the manifest hash rather than the run.
+          BRANCH="verity/grounding-docs"
+          git add -- "${CHANGED[@]}"
+          TREE="$(git write-tree)"
+          PARENT="$(git rev-parse HEAD)"
+          COMMIT="$(git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit-tree "$TREE" -p "$PARENT" -m 'docs(verity): persist product grounding')"
+          # Force, because the branch is rebuilt from the current default branch
+          # each run rather than extended. An open PR on it simply updates.
+          git push --force origin "$COMMIT:refs/heads/$BRANCH"
+          # Let go of these files locally now that they're safely committed on $BRANCH, so the
+          # docs/use-cases.md PR step further down (which commits everything still uncommitted)
+          # doesn't also pick them up and duplicate them into that PR.
+          git reset -- "${CHANGED[@]}"
+          for f in "${CHANGED[@]}"; do
+            if git cat-file -e "HEAD:$f" 2>/dev/null; then
+              git checkout -- "$f"
+            else
+              rm -f "$f"
+            fi
+          done
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Capture Codex file changes
+        id: codex_files
+        run: |
+          echo "=== Files modified by Codex ==="
+          git diff --name-only || true
+          echo "=== use-cases.md line count ==="
+          wc -l docs/use-cases.md 2>/dev/null || echo "docs/use-cases.md not found"
+          echo "=== use-cases.md heading count ==="
+          grep -c "^### " docs/use-cases.md 2>/dev/null || echo "0 headings"
+          # If Codex wrote to docs/use-cases.md via sandbox overlay, the
+          # git diff might show changes but the file might still be the old one.
+          # Capture the diff content as a fallback for the parser.
+          git diff docs/use-cases.md > /tmp/use-cases-diff.patch 2>/dev/null || true
+          if [ -s /tmp/use-cases-diff.patch ]; then
+            echo "=== Diff found: extracting new content from git diff ==="
+            # Extract only the added lines (lines starting with +, but not +++)
+            git diff docs/use-cases.md | grep "^+" | grep -v "^+++" | sed 's/^+//' > /tmp/use-cases-from-diff.md
+            wc -l /tmp/use-cases-from-diff.md
+            grep -c "^### " /tmp/use-cases-from-diff.md || echo "0 headings in diff"
+          else
+            echo "=== No diff found â€” file on disk is the Codex version ==="
+          fi
+
+      - name: Extract generated stories
+        id: extract_stories
+        env:
+          MAX_GENERATED_STORIES: ${{ steps.cfg.outputs.max_generated_stories }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          def normalize(value: str) -> str:
+            return re.sub(r"\s+", " ", (value or "")).strip()
+
+          def infer_tags(title: str, description: str):
+            haystack = f"{title} {description}".lower()
+            mapping = [
+              ("auth", "auth"),
+              ("login", "auth"),
+              ("checkout", "checkout"),
+              ("payment", "payments"),
+              ("search", "search"),
+              ("admin", "admin"),
+              ("settings", "settings"),
+              ("deploy", "deploy"),
+              ("test", "testing")
+            ]
+            tags = []
+            for needle, tag in mapping:
+              if needle in haystack and tag not in tags:
+                tags.append(tag)
+            return tags
+
+          def unescape_literal_newlines(value: str) -> str:
+            r"""Undo a shell `echo` that never got to be a real line break.
+
+            Codex sometimes writes this file with `echo "### Title\n\n**Description:**..."`
+            rather than a real multi-line write, and plain `echo` (no `-e`) does not
+            interpret the escape — so the file holds the two characters `\` and `n`
+            where a line break belongs. `(?m)^###` then only ever matches the very
+            first heading, because every heading after it is preceded by that literal
+            text rather than an actual newline.
+
+            Seen live: Codex wrote two full `### Story Title` sections in one `echo`,
+            the parser found 1 heading, and extracted 0 stories from an output that
+            plainly contained two. The run reported success and saved nothing.
+
+            Only triggered when literal escapes outnumber real newlines — ordinary
+            multi-line markdown that happens to mention `\n` in a code sample, say,
+            has far more real breaks than literal ones and is left exactly as it was.
+            """
+            literal = value.count("\\n")
+            real = value.count("\n")
+            if literal > real:
+              return value.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+            return value
+
+          # Try multiple sources for the use-cases file:
+          # 1. The file on disk (if Codex wrote directly)
+          # 2. The diff-extracted version (if Codex changes are in git diff only)
+          path = Path("docs/use-cases.md")
+          text = unescape_literal_newlines(path.read_text(encoding="utf-8")) if path.exists() else ""
+          heading_count = len(re.findall(r"(?m)^\s*###\s+", text))
+          print(f"[parser] Source 1 (disk): {path} has {heading_count} headings", flush=True)
+
+          diff_path = Path("/tmp/use-cases-from-diff.md")
+          if diff_path.exists():
+            diff_text = unescape_literal_newlines(diff_path.read_text(encoding="utf-8"))
+            diff_heading_count = len(re.findall(r"(?m)^\s*###\s+", diff_text))
+            print(f"[parser] Source 2 (diff): {diff_path} has {diff_heading_count} headings", flush=True)
+            if diff_heading_count > heading_count:
+              print(f"[parser] Using diff version ({diff_heading_count} > {heading_count})", flush=True)
+              text = diff_text
+
+          # â”€â”€ Parse stories from markdown â”€â”€
+          # Each story starts with ### and contains Description, Related Files, etc.
+          # Sub-headings like **Related Files:** are NOT separate stories.
+          stories = []
+          sections = re.split(r"(?m)^###\s+", text)
+          print(f"[parser] Total ### sections found: {len(sections) - 1}", flush=True)
+
+          skipped_non_stories = 0
+          for raw in sections[1:]:
+            lines = raw.splitlines()
+            if not lines:
+              continue
+            title = normalize(lines[0]).strip("[]")
+
+            # Skip section if it looks like a sub-heading, not a story
+            # Real stories have Description or Acceptance Criteria in their body
+            body_text = "\n".join(lines[1:])
+            is_real_story = any(marker in body_text for marker in
+              ["**Description:**", "Description:", "Acceptance Criteria",
+               "Given ", "Positive:", "Negative:", "As a ", "As an "])
+            if not is_real_story:
+              skipped_non_stories += 1
+              continue
+
+            body_lines = [line.rstrip() for line in lines[1:]]
+            description_parts = []
+            criteria = []
+            in_criteria = False
+            priority = "medium"
+            tags_from_story = []
+            related_files = []
+            upstream = ""
+            downstream = ""
+            in_related_files = False
+            for line in body_lines:
+              stripped = line.strip()
+              if not stripped:
+                continue
+
+              # Extract priority from "**Priority:** high"
+              priority_match = re.match(r"\*?\*?Priority:?\*?\*?\s*(\w+)", stripped, re.IGNORECASE)
+              if priority_match:
+                p = priority_match.group(1).lower()
+                if p in ("high", "medium", "low"):
+                  priority = p
+                continue
+
+              # Extract tags from "**Tags:** auth, admin, security"
+              tags_match = re.match(r"\*?\*?Tags:?\*?\*?\s*(.+)", stripped, re.IGNORECASE)
+              if tags_match:
+                tags_from_story = [t.strip().lower() for t in tags_match.group(1).split(",") if t.strip()]
+                continue
+
+              # Extract file references and upstream/downstream lines
+              if stripped.startswith("**Related Files"):
+                in_related_files = True
+                continue
+              if any(stripped.startswith(prefix) for prefix in
+                ["- Frontend:", "- API:", "- API client:", "- Backend:",
+                 "- State:"]):
+                related_files.append(stripped)
+                continue
+              if in_related_files and stripped.startswith("- "):
+                related_files.append(stripped)
+                continue
+              if stripped.startswith("**Upstream"):
+                in_related_files = False
+                upstream = re.sub(r"^\*?\*?Upstream:?\*?\*?\s*", "", stripped).strip()
+                continue
+              if stripped.startswith("**Downstream"):
+                in_related_files = False
+                downstream = re.sub(r"^\*?\*?Downstream:?\*?\*?\s*", "", stripped).strip()
+                continue
+              in_related_files = False
+              # Skip already-extracted priority/tags headers
+              if any(stripped.startswith(prefix) for prefix in ["**Priority", "**Tags"]):
+                continue
+
+              # Strip bold markers BEFORE the bullet marker. "[-*]" removes only
+              # one character, so "**Acceptance Criteria:**" became
+              # "*Acceptance Criteria:**", which then failed the section-header
+              # match below and fell through into description_parts. Every story
+              # the scan produced carried a stray "*Acceptance Criteria:**" on
+              # the end of its description, visible on the requirement card.
+              unbolded = normalize(stripped.replace("**", ""))
+              markerless = re.sub(r"^(?:[-*]|\d+\.)\s*", "", unbolded).strip()
+
+              if re.match(r"(?i)^(?:acceptance criteria|positive|negative|edge|permission)", markerless):
+                in_criteria = True
+                continue
+
+              is_bullet = bool(re.match(r"^(?:[-*]|\d+\.)\s+", stripped))
+              if in_criteria and is_bullet:
+                criteria.append(markerless)
+                continue
+              if re.match(r"^\*?\*?Description:?\*?\*?", stripped):
+                desc_text = re.sub(r"^\*?\*?Description:?\*?\*?\s*", "", stripped)
+                if desc_text:
+                  description_parts.append(normalize(desc_text))
+                continue
+              if not in_criteria:
+                description_parts.append(markerless)
+
+            description = normalize(" ".join(description_parts))
+            final_tags = tags_from_story if tags_from_story else infer_tags(title, description)
+
+            if title:
+              story_obj = {
+                "title": title,
+                "description": description,
+                "acceptanceCriteria": criteria,
+                "priority": priority,
+                "tags": final_tags
+              }
+              if related_files:
+                story_obj["relatedFiles"] = related_files
+              if upstream:
+                story_obj["upstream"] = upstream
+              if downstream:
+                story_obj["downstream"] = downstream
+              stories.append(story_obj)
+
+          print(f"[parser] Real stories extracted: {len(stories)}", flush=True)
+          print(f"[parser] Non-story sections skipped: {skipped_non_stories}", flush=True)
+
+          if not stories:
+            print("[parser] WARNING: No stories from ### parsing, trying bullet fallback", flush=True)
+            for line in text.splitlines():
+              match = re.match(r"^\s*(?:[-*]|\d+[.)])\s*(As\b.+)$", line, re.IGNORECASE)
+              if not match:
+                continue
+              title = normalize(match.group(1))
+              stories.append({
+                "title": title[:180],
+                "description": title,
+                "acceptanceCriteria": [],
+                "priority": "medium",
+                "tags": infer_tags(title, title)
+              })
+
+          max_stories = int(os.environ.get("MAX_GENERATED_STORIES", 500))
+          if len(stories) >= max_stories:
+            print(f"[parser] WARNING: Hit story cap! {len(stories)} stories found, capping at {max_stories}", flush=True)
+            print(f"[parser] Consider raising max_generated_stories in .verity/config.yml", flush=True)
+          stories = stories[:max_stories]
+          print(f"[parser] Final story count: {len(stories)}", flush=True)
+
+          # Write stories to file (for artifacts + PR)
+          Path("generated-stories.json").write_text(json.dumps(stories, indent=2), encoding="utf-8")
+          stories_json_size = Path("generated-stories.json").stat().st_size
+          print(f"[parser] generated-stories.json size: {stories_json_size:,} bytes", flush=True)
+
+          # Save a copy to /tmp/ â€” Create PR step may reset the workspace
+          import shutil
+          shutil.copy("generated-stories.json", "/tmp/generated-stories.json")
+          print(f"[parser] Backup saved to /tmp/generated-stories.json", flush=True)
+
+          # Write count to GitHub output (small â€” always fits)
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as handle:
+            handle.write(f"generated_story_count={len(stories)}\n")
+
+          # Try writing stories to GitHub output (may fail if too large)
+          stories_compact = json.dumps(stories, separators=(",", ":"))
+          GITHUB_OUTPUT_LIMIT = 120_000  # ~128KB env var limit with safety margin
+          if len(stories_compact) <= GITHUB_OUTPUT_LIMIT:
+            with open(out, "a", encoding="utf-8") as handle:
+              handle.write("generated_stories<<EOF\n")
+              handle.write(stories_compact)
+              handle.write("\nEOF\n")
+            print(f"[parser] Stories fit in GitHub output ({len(stories_compact):,} chars)", flush=True)
+          else:
+            print(f"[parser] WARNING: Stories too large for GitHub output ({len(stories_compact):,} chars > {GITHUB_OUTPUT_LIMIT:,} limit)", flush=True)
+            print(f"[parser] Stories will be sent via file-based callback instead", flush=True)
+          PY
+
+      - name: Detect coverage gaps (Pass 6)
+        continue-on-error: true
+        run: |
+          python scripts/detect-gaps.py
+          # Backup to /tmp/ (Create PR step may reset workspace)
+          cp coverage-gaps.json /tmp/coverage-gaps.json 2>/dev/null || true
+
+      # IMPORTANT: Callback MUST run BEFORE Create PR.
+      # Create PR triggers GitHub webhooks that fire GitHubFunction,
+      # which can overwrite the project document and clobber the stories
+      # that the callback just saved.
+      - name: Notify Verity - completed
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          JOB_STATUS: ${{ job.status }}
+          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
+          PR_BRANCH: verity/codex-usecases-${{ github.run_id }}
+          GROUNDING_PR_BRANCH: ${{ steps.grounding_branch.outputs.branch }}
+          ARTIFACT_NAME: verity-usecase-generation
+          GENERATED_STORY_COUNT: ${{ steps.extract_stories.outputs.generated_story_count }}
+          KNOWN_GENERATED: ${{ inputs.known_generated }}
+        run: |
+          # Bootstrap substitutes the callback-URL placeholder everywhere in this file,
+          # including inside any equality check written against it — which turned this
+          # guard into "real URL equals real URL", skipping every callback while still
+          # exiting 0, so the step stayed green and Verity heard nothing. An
+          # unsubstituted placeholder has no URL scheme; test for that instead.
+          case "$VERITY_CALLBACK_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "Skipping callback: callback URL not configured"
+              exit 0
+              ;;
+          esac
+          python - <<'PY' | curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @- \
+            -o /tmp/verity-callback-body.txt \
+            -w '%{http_code}' > /tmp/verity-callback-status.txt || echo 000 > /tmp/verity-callback-status.txt
+          import json
+          import os
+          import sys
+          import time
+          from pathlib import Path as P
+
+          generated_stories = []
+          for source_path in [P("/tmp/generated-stories.json"), P("generated-stories.json")]:
+            if source_path.exists():
+              try:
+                loaded = json.loads(source_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list) and len(loaded) > len(generated_stories):
+                  generated_stories = loaded
+                  print(f"[callback] Loaded {len(generated_stories)} stories from {source_path}", file=sys.stderr, flush=True)
+              except Exception as e:
+                print(f"[callback] WARNING: Failed to read {source_path}: {e}", file=sys.stderr, flush=True)
+
+          if not generated_stories:
+            print("[callback] WARNING: No stories found", file=sys.stderr, flush=True)
+          else:
+            for i, s in enumerate(generated_stories[:5]):
+              print(f"[callback]   {i+1}. {(s.get('title','') or '')[:60]}", file=sys.stderr, flush=True)
+            if len(generated_stories) > 5:
+              print(f"[callback]   ... and {len(generated_stories)-5} more", file=sys.stderr, flush=True)
+
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            # The filename Verity's dispatcher keys its tracking record by.
+            # GITHUB_WORKFLOW is this workflow's display name ("Verity Codex Use-Case
+            # Generation"), which never matches that key, so every dispatch-time record
+            # was orphaned from its completion-time counterpart.
+            "workflow": "codex-usecase-generation.yml",
+            # Minted by Verity at dispatch and echoed back here, so the queued record
+            # this run belongs to is updated in place rather than duplicated under
+            # GitHub's real run id.
+            "dispatch_id": os.environ.get("DISPATCH_ID") or None,
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            # The commit this scan actually read. Verity stores it on the
+            # per-repository generation checkpoint, so "when did we last
+            # successfully study this repo, and at what revision" is
+            # answerable later. GITHUB_SHA is a default runner variable.
+            "commit_sha": os.environ.get("GITHUB_SHA") or None,
+            # When this run finished, by the runner's clock. Verity orders
+            # generation checkpoints by it, so a retried callback for an older
+            # run cannot rewind the checkpoint past a newer one that already
+            # landed. Arrival time at the callback would invert exactly that.
+            "completed_at": int(time.time() * 1000),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": os.environ.get("JOB_STATUS"),
+            "pr_number": None,
+            "pr_url": None,
+            "pr_branch": os.environ.get("PR_BRANCH") or None,
+            "pr_create_outcome": None,
+            # The grounding-docs PR (README.md/docs/REPO_CONTEXT.md only) is a separate branch
+            # and PR from the docs/use-cases.md one above — opened by Verity's backend the same
+            # way (see ensureDevCyclePullRequest), independent of the enable_pr_creation gate,
+            # and always auto-merged. Empty/unset when there was no grounding diff to persist.
+            "grounding_pr_branch": os.environ.get("GROUNDING_PR_BRANCH") or None,
+            "artifact_name": os.environ.get("ARTIFACT_NAME") or None,
+            "codex_final_message": (os.environ.get("CODEX_FINAL_MESSAGE") or "")[:20000],
+            "generated_story_count": len(generated_stories),
+            "generated_stories": generated_stories,
+            # A Codex step that succeeds (exit 0) can still write an empty or
+            # unparseable use-cases.md, and job status alone can't tell that apart
+            # from "scanned this repo again, found nothing new to add" on a repeat
+            # run. known_generated=false means this repo has no prior successful
+            # generation on record, so zero stories here is very unlikely to be a
+            # legitimate "nothing new" — it's the signal Verity should treat as a
+            # failed run rather than a quiet, empty success.
+            "likely_failed_generation": len(generated_stories) == 0 and os.environ.get("KNOWN_GENERATED", "").strip().lower() != "true",
+          }
+
+          for gap_path in [P("/tmp/coverage-gaps.json"), P("coverage-gaps.json")]:
+            if gap_path.exists():
+              try:
+                payload["coverage_gaps"] = json.loads(gap_path.read_text(encoding="utf-8"))
+                break
+              except Exception:
+                pass
+
+          payload_json = json.dumps(payload)
+          print(f"[callback] Sending {len(generated_stories)} stories via curl ({len(payload_json):,} bytes)", file=sys.stderr, flush=True)
+          print(payload_json)
+          PY
+
+          # Reported, not fatal: by this point the work is done and the PR step
+          # below still has value. But it must never again be silent — a
+          # discarded result that looks like a success is the worst of both.
+          status=$(cat /tmp/verity-callback-status.txt 2>/dev/null || echo 000)
+          case "$status" in
+            2*) echo "[callback] Verity accepted the completion callback (HTTP $status)" ;;
+            401|403)
+              echo "::error::Verity rejected this repository's callback token (HTTP $status), so the results of this run were NOT saved. Re-save the project's GitHub secrets from Verity." >&2
+              cat /tmp/verity-callback-body.txt 2>/dev/null >&2 || true
+              ;;
+            *)
+              echo "::error::Verity did not accept the completion callback (HTTP $status), so the results of this run were NOT saved." >&2
+              cat /tmp/verity-callback-body.txt 2>/dev/null >&2 || true
+              ;;
+          esac
+
+      # Verity already heard about this above — the callback still ran and still
+      # reported everything it knows, so nothing is lost by failing now. But a
+      # Codex step that reports `success` while `known_generated=false` and it
+      # wrote zero stories is not a legitimate empty result; it is Codex ending
+      # the session without doing the work (e.g. announcing a plan and then
+      # stopping — the exact failure this run exists to catch). Reporting that
+      # as a green run buries it: it looks identical, in every dashboard that
+      # only reads job status, to a run that actually did the job. Fail here
+      # instead, so it shows up as what it is.
+      - name: Fail loudly if Codex reported success but wrote nothing
+        if: always() && steps.run_codex.outcome == 'success'
+        env:
+          GENERATED_STORY_COUNT: ${{ steps.extract_stories.outputs.generated_story_count }}
+          KNOWN_GENERATED: ${{ inputs.known_generated }}
+        run: |
+          known_generated="$(printf '%s' "$KNOWN_GENERATED" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          if [ "${GENERATED_STORY_COUNT:-0}" = "0" ] && [ "$known_generated" != "true" ]; then
+            echo "::error::Codex exited successfully but wrote zero ### stories to docs/use-cases.md, and this repo has no prior successful generation (known_generated=false) — a legitimate 'nothing to add' result. Treating this as a failed run. Check the 'Run Codex' step's log for what it actually did before stopping." >&2
+            exit 1
+          fi
+
+      - name: Clean transient artifacts before PR
+        run: |
+          rm -f codex-prompt.md codex-output.md generated-stories.json code-inventory.md coverage-gaps.json
+
+      - name: Enforce PR creation gate
+        id: pr_gate
+        env:
+          INPUT_ENABLE_PR_CREATION: ${{ inputs.enable_pr_creation }}
+          CONFIG_AUTOMATION_PAUSED: ${{ steps.cfg.outputs.automation_paused }}
+          CONFIG_AUTO_CREATE_PR: ${{ steps.cfg.outputs.auto_create_pr_enabled }}
+          VAR_ENABLE_AUTO_PR: ${{ vars.VERITY_ENABLE_AUTO_PR }}
+        run: |
+          normalize() {
+            val="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+            if [ "$val" = "1" ] || [ "$val" = "true" ] || [ "$val" = "yes" ] || [ "$val" = "on" ]; then
+              echo "true"
+            else
+              echo "false"
+            fi
+          }
+
+          if [ "$(normalize "$CONFIG_AUTOMATION_PAUSED")" = "true" ]; then
+            echo "PR creation blocked: automation.paused is true in .verity/config.yml." >&2
+            exit 1
+          fi
+
+          manual_enabled="$(normalize "$INPUT_ENABLE_PR_CREATION")"
+          config_enabled="$(normalize "$CONFIG_AUTO_CREATE_PR")"
+          var_enabled="$(normalize "$VAR_ENABLE_AUTO_PR")"
+
+          if [ "$manual_enabled" != "true" ] && { [ "$config_enabled" != "true" ] || [ "$var_enabled" != "true" ]; }; then
+            # Not opted in to opening a PR. That is a mode, not a failure: the
+            # run has already done (or is about to do) the actual work, and
+            # failing here threw all of it away — and left the linked story
+            # locked on "Implementation started" with nothing to release it.
+            # Downstream PR steps check `allowed`; everything else proceeds.
+            echo "PR creation not enabled: set workflow input enable_pr_creation=true for a manual run, or automation.auto_create_pr=true plus repo variable VERITY_ENABLE_AUTO_PR=true for automated runs. Continuing without opening a PR." >&2
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=pr-creation-not-enabled" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "allowed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create PR
+        id: cpr
+        continue-on-error: true
+        if: ${{ steps.pr_gate.outputs.allowed == 'true' }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ github.token }}
+          commit-message: "docs(verity): update use cases"
+          branch: verity/codex-usecases-${{ github.run_id }}
+          delete-branch: true
+          title: "Verity: update use cases"
+          body: |
+            Automated use case updates generated by Verity/Codex.
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            ## Codex summary
+            ${{ steps.run_codex.outputs.final-message }}
+          labels: "verity:agent,verity:docs"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-usecase-generation
+          path: |
+            codex-output.md
+            codex-prompt.md
+            generated-stories.json
+            code-inventory.md
+            coverage-gaps.json
+          if-no-files-found: ignore
