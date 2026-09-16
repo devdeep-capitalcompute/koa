@@ -4,8 +4,8 @@
   "verity_project_id": "a615766c-7fe0-4738-bab8-90f4b5e750a8",
   "repository": "devdeep-capitalcompute/koa",
   "default_branch": "master",
-  "manifest_hash": "e8bdb95962ea1f979af03396d329893a12cb6e00d6086db63e609056a4f8d5ae",
-  "created_at": "2026-09-16T13:21:00.624Z",
+  "manifest_hash": "fbdc235e88d917d149813a3f3f4ddef07b875b5b4638aa27340d385b8ab0548c",
+  "created_at": "2026-09-16T19:34:26.360Z",
   "rollout_channel": "stable",
   "validation_status": "pending",
   "managed_file_ownership": {

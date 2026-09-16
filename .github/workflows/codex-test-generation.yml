@@ -170,6 +170,7 @@ jobs:
           DISPATCH_ID: ${{ inputs.dispatch_id }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           VERITY_DELIVERY_ID: ${{ inputs.verity_delivery_id }}
+          E2E_SPECS_COUNT: ${{ steps.e2e_specs.outputs.count || '0' }}
         run: |
           python - <<'PY' > /tmp/verity-callback.json
           import json, os, pathlib
@@ -198,6 +199,18 @@ jobs:
             "verity_delivery_id": os.environ.get("VERITY_DELIVERY_ID") or None,
             "dispatch_id": os.environ.get("DISPATCH_ID") or None
           }
+          # The specs this run wrote. Verity parses each one into a test case
+          # carrying its `specPath`, which is what makes the requirement it
+          # belongs to provable rather than merely described.
+          specs_count = int(os.environ.get("E2E_SPECS_COUNT") or "0")
+          specs_path = pathlib.Path("/tmp/e2e-spec-files.json")
+          if specs_count > 0 and specs_path.exists():
+            try:
+              specs = json.loads(specs_path.read_text(encoding="utf-8"))
+              if specs:
+                payload["e2e_spec_files"] = specs
+            except Exception:
+              pass
           print(json.dumps(payload))
           PY
             curl -sS -X POST "$VERITY_CALLBACK_URL" \
@@ -410,6 +423,69 @@ jobs:
               bash -lc "$cmd"
             done <<< "${{ steps.cfg.outputs.build_cmds }}"
                     fi
+
+      # ─── Report the specs this run authored, so Verity can capture them ───
+      #
+      # Without this step the specs reached Verity only by accident. The
+      # callback's spec-capture block keys off `e2e_spec_files`, which only
+      # `codex-dev-cycle` and `verity-pr-auto-fix` ever sent — so a run
+      # dispatched purely to write tests for an existing feature produced real
+      # Playwright files, opened a real pull request, and left the requirement
+      # reading "nothing tests this yet" until some unrelated dev cycle
+      # happened to sweep the whole repository later. For a requirement
+      # describing behaviour that already exists there is no later dev cycle,
+      # so it read that way forever.
+      #
+      # Only the files this run added or changed, deliberately. `codex-dev-cycle`
+      # sends every spec in the repository, which is harmless for capture but
+      # would have Verity attribute this run's verdict to requirements it never
+      # exercised. A run is evidence for what it wrote.
+      - name: Collect authored E2E spec files
+        id: e2e_specs
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          specs_json=$(python3 - <<'PY'
+          import json, subprocess
+
+          def git(*args):
+            try:
+              out = subprocess.run(["git", *args], capture_output=True, text=True, check=True)
+              return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+            except Exception:
+              return []
+
+          # Tracked edits plus brand-new files. A generated spec is almost always
+          # the second, and `git diff` alone never sees it.
+          candidates = set(git("diff", "--name-only", "HEAD")) | set(
+            git("ls-files", "--others", "--exclude-standard")
+          )
+
+          def is_spec(path):
+            if "node_modules" in path:
+              return False
+            if not (path.endswith(".spec.ts") or path.endswith(".spec.js")):
+              return False
+            return "e2e" in path.split("/") or "tests" in path.split("/")
+
+          specs = []
+          for path in sorted(p for p in candidates if is_spec(p)):
+            try:
+              content = open(path, encoding="utf-8").read()
+            except Exception:
+              continue
+            # A stub too short to hold a test assertion is not a test.
+            if len(content.strip()) > 50:
+              specs.append({"path": path, "content": content[:50000]})
+
+          print(json.dumps(specs))
+          PY
+          )
+          echo "$specs_json" > /tmp/e2e-spec-files.json
+          count=$(echo "$specs_json" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Collected $count authored E2E spec file(s) for test case capture"
 
       - name: Clean transient artifacts before PR
         run: |
