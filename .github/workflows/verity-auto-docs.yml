@@ -45,10 +45,13 @@ jobs:
 
           cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
           automation = cfg.get("automation", {}) or {}
+          verity = cfg.get("verity", {}) or {}
           out = Path(os.environ["GITHUB_OUTPUT"])
           with out.open("a", encoding="utf-8") as f:
             f.write(f"automation_paused={'true' if automation.get('paused') else 'false'}\n")
             f.write(f"auto_create_pr_enabled={'true' if automation.get('auto_create_pr') else 'false'}\n")
+            f.write(f"project_id={str(verity.get('project_id', '')).strip()}\n")
+            f.write(f"callback_url={str(verity.get('callback_url', '')).strip()}\n")
           PY
 
       - name: Sync docs
@@ -119,19 +122,83 @@ jobs:
 
           echo "allowed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Create docs sync PR (manual mode)
+      # Push the branch; let Verity open the pull request.
+      #
+      # This used to be `peter-evans/create-pull-request` with `github.token`,
+      # which needs "Allow GitHub Actions to create and approve pull requests"
+      # in the customer's repository settings - off by default, unreadable and
+      # unsettable by Verity, and nothing in onboarding asks for it. On koa the
+      # step died with "GitHub Actions is not permitted to create or approve
+      # pull requests" and the regenerated docs were simply thrown away.
+      #
+      # Every other Verity workflow already routes around this: the runner
+      # pushes a branch and reports it in the completed callback, and Verity's
+      # own GitHub App installation token - which the setting does not restrict
+      # - opens the pull request. This is the last workflow that had not been
+      # moved over.
+      #
+      # The branch is rolling, not per-run. codex-usecase-generation.yml keyed
+      # its grounding branch on ${{ github.run_id }} and Verity, which finds the
+      # pull request by looking for an open one on that branch, opened a fresh
+      # duplicate on every single run. A fixed name updates the one open PR.
+      - name: Push docs sync branch
+        id: docs_branch
         if: ${{ github.event_name == 'workflow_dispatch' && steps.diff.outputs.changed == 'true' && steps.pr_gate.outputs.allowed == 'true' }}
-        uses: peter-evans/create-pull-request@v6
-        with:
-          token: ${{ github.token }}
-          commit-message: "docs(verity): sync repo context and handoff"
-          branch: verity/auto-docs-${{ github.run_id }}
-          delete-branch: true
-          title: "Verity: sync repository docs context"
-          body: |
-            Automated documentation sync for onboarding context.
+        run: |
+          set -euo pipefail
+          BRANCH="verity/auto-docs"
+          git add -- docs/REPO_CONTEXT.md docs/AI_HANDOFF.md
+          TREE="$(git write-tree)"
+          PARENT="$(git rev-parse HEAD)"
+          COMMIT="$(git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit-tree "$TREE" -p "$PARENT" -m 'docs(verity): sync repo context and handoff')"
+          git push --force origin "$COMMIT:refs/heads/$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
-            - Updated by: `scripts/sync_repo_docs.py`
-            - Workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          labels: "verity:agent,verity:docs"
-          draft: ${{ inputs.pr_draft == 'true' }}
+      - name: Notify Verity - completed
+        if: ${{ always() && steps.docs_branch.outputs.branch != '' }}
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          DOCS_PR_BRANCH: ${{ steps.docs_branch.outputs.branch }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          # Bootstrap substitutes the callback-URL placeholder everywhere in this
+          # file, so a guard written against the placeholder becomes "real URL
+          # equals real URL" and skips every callback while still exiting 0. An
+          # unsubstituted placeholder has no URL scheme; test for that instead.
+          case "$VERITY_CALLBACK_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "Skipping callback: callback URL not configured"
+              exit 0
+              ;;
+          esac
+          python - <<'PY' | curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @- \
+            -o /tmp/verity-callback-body.txt \
+            -w '%{http_code}' > /tmp/verity-callback-status.txt || echo 000 > /tmp/verity-callback-status.txt
+          import json
+          import os
+
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": "verity-auto-docs.yml",
+            "status": os.environ.get("JOB_STATUS"),
+            "docs_pr_branch": os.environ.get("DOCS_PR_BRANCH"),
+            "run_url": f"{os.environ.get('GITHUB_SERVER_URL','')}/{os.environ.get('GITHUB_REPOSITORY','')}/actions/runs/{os.environ.get('GITHUB_RUN_ID','')}",
+          }
+          print(json.dumps(payload))
+          PY
+          STATUS="$(cat /tmp/verity-callback-status.txt)"
+          echo "Verity callback responded $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "Callback body:" && cat /tmp/verity-callback-body.txt || true
+          fi
