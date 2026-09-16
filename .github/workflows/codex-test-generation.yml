@@ -264,6 +264,15 @@ jobs:
       # One prompt file per template, written up front so the passes below stay
       # identical apart from which file they read.
       #
+      # Written to `$RUNNER_TEMP`, not the workspace. Each pass below runs Codex
+      # with `workspace-write`, so a prompt sitting in the checkout is a file the
+      # *previous* pass can delete — and did: with `template_type: all`, the
+      # master pass finished and the error pass died on "The configured Codex
+      # prompt file could not be read", taking the equivalence pass and the whole
+      # run with it. Outside the workspace the sandbox cannot reach them, they
+      # can never be swept into the customer's pull request, and nothing has to
+      # remember to clean them up.
+      #
       # `scope` arrives from a requirement's title and description — user text —
       # and used to be interpolated straight into the shell by the runner. It
       # travels as an environment variable now, where a backtick or a `$(` is
@@ -309,11 +318,14 @@ jobs:
           base = pathlib.Path(".github/codex/prompts/test-generation.md").read_text(encoding="utf-8")
           scope = (os.environ.get("SCOPE") or "").strip()
 
+          out_dir = pathlib.Path(os.environ["RUNNER_TEMP"]) / "verity-prompts"
+          out_dir.mkdir(parents=True, exist_ok=True)
+
           for template in selected:
             parts = [base, "", f"## Test Template: {template}", "", FOCUS[template]]
             if scope:
               parts += ["", "## Scope", "", scope]
-            pathlib.Path(f"codex-prompt-{template}.md").write_text("\n".join(parts) + "\n", encoding="utf-8")
+            (out_dir / f"codex-prompt-{template}.md").write_text("\n".join(parts) + "\n", encoding="utf-8")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
             for template in FOCUS:
@@ -351,8 +363,8 @@ jobs:
           multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
           model: bluesky/auto
           effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
-          prompt-file: codex-prompt-master.md
-          output-file: codex-output-master.md
+          prompt-file: ${{ runner.temp }}/verity-prompts/codex-prompt-master.md
+          output-file: ${{ runner.temp }}/verity-prompts/codex-output-master.md
           sandbox: workspace-write
 
       - name: Prepare Codex permission profile
@@ -373,8 +385,8 @@ jobs:
           multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
           model: bluesky/auto
           effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
-          prompt-file: codex-prompt-error.md
-          output-file: codex-output-error.md
+          prompt-file: ${{ runner.temp }}/verity-prompts/codex-prompt-error.md
+          output-file: ${{ runner.temp }}/verity-prompts/codex-output-error.md
           sandbox: workspace-write
 
       - name: Prepare Codex permission profile
@@ -395,8 +407,8 @@ jobs:
           multra-api-key: ${{ secrets.MULTRA_API_KEY || secrets.BLUESKY_API_KEY }}
           model: bluesky/auto
           effort: ${{ vars.VERITY_CODEX_EFFORT != '' && vars.VERITY_CODEX_EFFORT || 'medium' }}
-          prompt-file: codex-prompt-equivalence.md
-          output-file: codex-output-equivalence.md
+          prompt-file: ${{ runner.temp }}/verity-prompts/codex-prompt-equivalence.md
+          output-file: ${{ runner.temp }}/verity-prompts/codex-output-equivalence.md
           sandbox: workspace-write
 
       - name: Sync docs context (auto document mode)
@@ -495,6 +507,9 @@ jobs:
           # `__pycache__/*.pyc` files. Mirrors the same step in codex-dev-cycle.
           find . -type d -name '__pycache__' -prune -exec rm -rf {} +
           find . -type f -name '*.pyc' -delete
+          # The prompt and output files live in $RUNNER_TEMP now, so there is
+          # nothing here to sweep. Left as a belt-and-braces catch for a
+          # repository still carrying one from an earlier run.
           rm -f codex-prompt-*.md codex-output-*.md
 
       - name: Enforce PR creation gate
