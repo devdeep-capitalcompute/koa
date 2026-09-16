@@ -5,8 +5,17 @@ const assert = require('node:assert/strict')
 const Koa = require('../../')
 const net = require('net')
 const { once } = require('events')
+const response = require('../../test-helpers/context').response
 
 describe('res.writable', () => {
+  it('should report the response transport state', () => {
+    const res = response()
+    assert.strictEqual(res.writable, true)
+
+    res.res.finished = true
+    assert.strictEqual(res.writable, false)
+  })
+
   describe('when continuous requests in one persistent connection', () => {
     it('should always be writable and respond to all requests', async () => {
       const app = new Koa()

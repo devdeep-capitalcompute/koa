@@ -14,10 +14,19 @@ describe('res.status=', () => {
         const res = response()
         res.status = 403
         assert.strictEqual(res.status, 403)
+        assert.strictEqual(res.message, 'Forbidden')
       })
 
       it('should not throw', () => {
         response().status = 403
+      })
+
+      it('should accept the inclusive standard status range boundaries', () => {
+        for (const status of [100, 999]) {
+          const res = response()
+          res.status = status
+          assert.strictEqual(res.status, status)
+        }
       })
     })
 
@@ -27,15 +36,32 @@ describe('res.status=', () => {
           response().status = 99
         }, /invalid status code: 99/)
       })
+
+      it('should reject non-integer and out-of-range values', () => {
+        const invalidStatuses = [
+          { value: 99, message: /invalid status code: 99/ },
+          { value: 1000, message: /invalid status code: 1000/ },
+          { value: 200.5, message: /status code must be a number/ },
+          { value: null, message: /status code must be a number/ },
+          { value: NaN, message: /status code must be a number/ }
+        ]
+
+        for (const { value, message } of invalidStatuses) {
+          assert.throws(() => {
+            response().status = value
+          }, message)
+        }
+      })
     })
 
     describe('and custom status', () => {
-      beforeEach(() => { statuses['700'] = 'custom status' })
+      beforeEach(() => { statuses.message['700'] = 'custom status' })
 
       it('should set the status', () => {
         const res = response()
         res.status = 700
         assert.strictEqual(res.status, 700)
+        assert.strictEqual(res.message, 'custom status')
       })
 
       it('should not throw', () => {

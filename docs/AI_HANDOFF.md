@@ -15,8 +15,8 @@ It is intended to give new developers and AI agents immediate, accurate context.
 ## Snapshot
 - Repository: `devdeep-capitalcompute/koa`
 - Default branch: `master`
-- Commit: `2d6092fe69e9d903e96e125a4d02448abb58c0f9`
-- Commit date: `2026-09-16T18:51:25+05:30`
+- Commit: `ece687b4bc06ab183aabf375863a8bc42a6ffb7c`
+- Commit date: `2026-09-16T20:16:23Z`
 
 ## Start Here
 1. Read `AGENTS.md`.

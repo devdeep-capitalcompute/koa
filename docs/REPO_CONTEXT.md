@@ -46,8 +46,8 @@ _(none configured)_
 
 ## Auto Documentation Snapshot
 <!-- verity:auto-doc:start -->
-- Commit: `eddb9874f8ba004ae98c87dfff2d59be87b21050`
-- Commit date: `2026-09-16T19:35:11Z`
+- Commit: `ece687b4bc06ab183aabf375863a8bc42a6ffb7c`
+- Commit date: `2026-09-16T20:16:23Z`
 - Repository: `devdeep-capitalcompute/koa`
 - Default branch: `master`
 
