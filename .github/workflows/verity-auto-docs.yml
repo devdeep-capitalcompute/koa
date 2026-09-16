@@ -1,0 +1,137 @@
+name: Verity Auto Docs
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_draft:
+        description: "Create docs sync PR as draft (true/false)"
+        required: false
+        default: "false"
+      enable_pr_creation:
+        description: "Explicitly allow this run to create/update a PR (true/false)"
+        required: true
+        default: "false"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync_docs:
+    if: ${{ github.event_name == 'workflow_dispatch' || !startsWith(github.head_ref, 'verity/bootstrap-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load automation config
+        id: cfg
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          automation = cfg.get("automation", {}) or {}
+          out = Path(os.environ["GITHUB_OUTPUT"])
+          with out.open("a", encoding="utf-8") as f:
+            f.write(f"automation_paused={'true' if automation.get('paused') else 'false'}\n")
+            f.write(f"auto_create_pr_enabled={'true' if automation.get('auto_create_pr') else 'false'}\n")
+          PY
+
+      - name: Sync docs
+        env:
+          VERITY_DOCS_STABLE_SNAPSHOT: ${{ github.event_name == 'pull_request' && 'true' || 'false' }}
+          # The repository's own default branch. Without this the script fell
+          # back to GITHUB_BASE_REF, which is the branch a PR targets, so a PR
+          # into a non-default branch rewrote the field and could never satisfy
+          # the staleness check.
+          VERITY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python scripts/sync_repo_docs.py
+
+      - name: Detect docs changes
+        id: diff
+        run: |
+          if git diff --quiet -- docs/REPO_CONTEXT.md docs/AI_HANDOFF.md; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail PR when docs are stale
+        if: ${{ github.event_name == 'pull_request' && steps.diff.outputs.changed == 'true' }}
+        run: |
+          echo "Documentation is out of date for this PR." >&2
+          echo "Run: python scripts/sync_repo_docs.py" >&2
+          git --no-pager diff -- docs/REPO_CONTEXT.md docs/AI_HANDOFF.md || true
+          exit 1
+
+      - name: Enforce PR creation gate
+        id: pr_gate
+        if: ${{ github.event_name == 'workflow_dispatch' && steps.diff.outputs.changed == 'true' }}
+        env:
+          INPUT_ENABLE_PR_CREATION: ${{ inputs.enable_pr_creation }}
+          CONFIG_AUTOMATION_PAUSED: ${{ steps.cfg.outputs.automation_paused }}
+          CONFIG_AUTO_CREATE_PR: ${{ steps.cfg.outputs.auto_create_pr_enabled }}
+          VAR_ENABLE_AUTO_PR: ${{ vars.VERITY_ENABLE_AUTO_PR }}
+        run: |
+          normalize() {
+            val="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+            if [ "$val" = "1" ] || [ "$val" = "true" ] || [ "$val" = "yes" ] || [ "$val" = "on" ]; then
+              echo "true"
+            else
+              echo "false"
+            fi
+          }
+
+          if [ "$(normalize "$CONFIG_AUTOMATION_PAUSED")" = "true" ]; then
+            echo "PR creation blocked: automation.paused is true in .verity/config.yml." >&2
+            exit 1
+          fi
+
+          manual_enabled="$(normalize "$INPUT_ENABLE_PR_CREATION")"
+          config_enabled="$(normalize "$CONFIG_AUTO_CREATE_PR")"
+          var_enabled="$(normalize "$VAR_ENABLE_AUTO_PR")"
+
+          if [ "$manual_enabled" != "true" ] && { [ "$config_enabled" != "true" ] || [ "$var_enabled" != "true" ]; }; then
+            # Not opted in to opening a PR. That is a mode, not a failure: the
+            # run has already done (or is about to do) the actual work, and
+            # failing here threw all of it away — and left the linked story
+            # locked on "Implementation started" with nothing to release it.
+            # Downstream PR steps check `allowed`; everything else proceeds.
+            echo "PR creation not enabled: set workflow input enable_pr_creation=true for a manual run, or automation.auto_create_pr=true plus repo variable VERITY_ENABLE_AUTO_PR=true for automated runs. Continuing without opening a PR." >&2
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=pr-creation-not-enabled" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "allowed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create docs sync PR (manual mode)
+        if: ${{ github.event_name == 'workflow_dispatch' && steps.diff.outputs.changed == 'true' && steps.pr_gate.outputs.allowed == 'true' }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ github.token }}
+          commit-message: "docs(verity): sync repo context and handoff"
+          branch: verity/auto-docs-${{ github.run_id }}
+          delete-branch: true
+          title: "Verity: sync repository docs context"
+          body: |
+            Automated documentation sync for onboarding context.
+
+            - Updated by: `scripts/sync_repo_docs.py`
+            - Workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          labels: "verity:agent,verity:docs"
+          draft: ${{ inputs.pr_draft == 'true' }}

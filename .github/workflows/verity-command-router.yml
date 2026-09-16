@@ -1,0 +1,97 @@
+name: Verity Command Router
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to route into codex-dev-cycle (optional)"
+        required: false
+        default: ""
+      user_request:
+        description: "Manual request for codex-dev-cycle"
+        required: true
+        default: ""
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+      enable_dispatch:
+        description: "Explicitly dispatch codex-dev-cycle (true/false)"
+        required: true
+        default: "false"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  route:
+    if: ${{ inputs.enable_dispatch == 'true' && vars.VERITY_ENABLE_COMMAND_ROUTER == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          automation = cfg.get("automation", {}) or {}
+          workflow_enablement = automation.get("workflow_enablement", {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+          enabled = bool(workflow_enablement.get("command_router"))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            handle.write(f"project_id={project_override or str(verity.get('project_id','')).strip()}\n")
+            handle.write(f"callback_url={callback_override or str(verity.get('callback_url','')).strip()}\n")
+            handle.write(f"command_router_enabled={'true' if enabled else 'false'}\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Dispatch codex-dev-cycle workflow
+        if: ${{ steps.cfg.outputs.command_router_enabled == 'true' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const defaultBranch = context.payload.repository?.default_branch || context.ref.replace('refs/heads/', '');
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'codex-dev-cycle.yml',
+              ref: defaultBranch,
+              inputs: {
+                issue_number: process.env.ISSUE_NUMBER || '',
+                user_request: process.env.USER_REQUEST || '',
+                callback_url: process.env.CALLBACK_URL || '',
+                verity_project_id: process.env.PROJECT_ID || '',
+                enable_pr_creation: 'true'
+              }
+            });
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          USER_REQUEST: ${{ inputs.user_request }}
+          CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          PROJECT_ID: ${{ steps.cfg.outputs.project_id }}

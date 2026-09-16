@@ -1,0 +1,305 @@
+name: Verity Direct Codex through Multra
+description: Runs Codex CLI directly against Multra with exact-SHA repository context and no Responses proxy.
+
+inputs:
+  multra-api-key:
+    description: Multra application credential used by the custom Codex provider.
+    required: true
+  multra-origin:
+    description: HTTPS origin for Multra.
+    required: false
+    default: https://multra.ai
+  prompt:
+    required: false
+    default: ''
+  prompt-file:
+    required: false
+    default: ''
+  output-file:
+    required: false
+    default: ''
+  model:
+    required: false
+    default: bluesky/auto
+  effort:
+    required: false
+    default: ''
+  working-directory:
+    required: false
+    default: ''
+  sandbox:
+    description: Codex filesystem sandbox. Verity permits read-only or workspace-write.
+    required: false
+    default: read-only
+  codex-version:
+    description: Pinned @openai/codex CLI version.
+    required: false
+    default: 0.154.0
+  output-schema:
+    description: Inline JSON schema for the final Codex response.
+    required: false
+    default: ''
+  output-schema-file:
+    description: JSON schema file for the final Codex response.
+    required: false
+    default: ''
+  codex-home:
+    description: Optional trusted runner directory where Codex session evidence is persisted for Verity metering and diagnostics.
+    required: false
+    default: ''
+
+outputs:
+  final-message:
+    value: ${{ steps.codex.outputs.final-message }}
+  context-handle:
+    value: ${{ steps.context.outputs.context_handle }}
+  context-index-hash:
+    value: ${{ steps.context.outputs.context_index_hash }}
+  context-selected-files:
+    value: ${{ steps.context.outputs.selected_file_count }}
+  context-selected-spans:
+    value: ${{ steps.context.outputs.selected_span_count }}
+  context-repository:
+    value: ${{ steps.context.outputs.repository }}
+  context-commit-sha:
+    value: ${{ steps.context.outputs.commit_sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve exact checkout identity
+      id: identity
+      shell: bash
+      env:
+        MULTRA_ORIGIN: ${{ inputs.multra-origin }}
+        REPOSITORY: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        commit_sha="$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')"
+        branch_ref="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+        export COMMIT_SHA="$commit_sha" BRANCH_REF="$branch_ref"
+        python - <<'PY'
+        import os, re
+        from urllib.parse import urlencode, urlsplit, urlunsplit
+        repository = (os.environ.get('REPOSITORY') or '').strip()
+        commit = (os.environ.get('COMMIT_SHA') or '').strip().lower()
+        branch = (os.environ.get('BRANCH_REF') or '').strip()
+        parsed = urlsplit((os.environ.get('MULTRA_ORIGIN') or '').strip().rstrip('/'))
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository): raise SystemExit('GitHub repository identity is invalid')
+        if not re.fullmatch(r'(?:[a-f0-9]{40}|[a-f0-9]{64})', commit): raise SystemExit('Checkout did not resolve to a full Git object ID')
+        if parsed.scheme != 'https' or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment: raise SystemExit('Multra origin must be an absolute HTTPS origin')
+        origin = urlunsplit((parsed.scheme, parsed.netloc, '', '', '')).rstrip('/')
+        query = urlencode({'repository_full_name': repository, 'commit_sha': commit, 'code_context_required': 'false'})
+        with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+            out.write(f'repository={repository}\ncommit_sha={commit}\nbranch_ref={branch}\norigin={origin}\n')
+            out.write(f'preflight_endpoint={origin}/v1/context/responses?{query}\n')
+        PY
+
+    - name: Wait for exact Multra graph through application context
+      shell: bash
+      env:
+        MULTRA_API_KEY: ${{ inputs.multra-api-key }}
+        MULTRA_BASE_URL: ${{ steps.identity.outputs.origin }}
+        MULTRA_GRAPH_SHA: ${{ steps.identity.outputs.commit_sha }}
+        GITHUB_REPOSITORY: ${{ steps.identity.outputs.repository }}
+      run: python scripts/wait_multra_context_ready.py
+
+    - name: Resolve and pin exact repository context
+      id: context
+      shell: bash
+      env:
+        MULTRA_API_KEY: ${{ inputs.multra-api-key }}
+        MULTRA_ENDPOINT: ${{ steps.identity.outputs.preflight_endpoint }}
+        MULTRA_PROMPT: ${{ inputs.prompt }}
+        MULTRA_PROMPT_FILE: ${{ inputs.prompt-file }}
+        GITHUB_REPOSITORY: ${{ steps.identity.outputs.repository }}
+      run: python scripts/probe_multra_context.py
+
+    - name: Set up Node.js
+      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+      with:
+        node-version: '24'
+
+    - name: Install Linux sandbox prerequisites
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Use the distribution helper and its scoped Ubuntu profile.
+        # Never disable AppArmor or the Codex filesystem/network sandbox.
+        if [ "$(uname -s)" != Linux ]; then echo "This runner requires Linux" >&2; exit 1; fi
+        sudo -n apt-get update -qq
+        sudo -n apt-get install --no-install-recommends -y bubblewrap apparmor-profiles apparmor-utils
+        if [ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ] && [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1 ]; then
+          if [ ! -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo -n install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+          fi
+          sudo -n apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+        fi
+        bwrap --version
+
+    - name: Install pinned Codex CLI
+      shell: bash
+      env:
+        CODEX_VERSION: ${{ inputs.codex-version }}
+      run: |
+        set -euo pipefail
+        npm install -g "@openai/codex@${CODEX_VERSION}"
+        codex --version
+
+    - name: Configure direct Multra provider
+      id: config
+      shell: bash
+      env:
+        FINAL_ENDPOINT: ${{ steps.context.outputs.endpoint }}
+        EXPECTED_REPOSITORY: ${{ steps.identity.outputs.repository }}
+        EXPECTED_COMMIT: ${{ steps.identity.outputs.commit_sha }}
+        EXPECTED_HANDLE: ${{ steps.context.outputs.context_handle }}
+        MODEL: ${{ inputs.model }}
+      run: |
+        set -euo pipefail
+        config_file="$RUNNER_TEMP/verity-direct-config-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RANDOM}.toml"
+        export CONFIG_FILE="$config_file"
+        python - <<'PY'
+        import json, os
+        from pathlib import Path
+        from urllib.parse import parse_qsl, urlsplit, urlunsplit
+        endpoint = urlsplit(os.environ['FINAL_ENDPOINT'])
+        query = dict(parse_qsl(endpoint.query, keep_blank_values=True))
+        repository, commit, handle = os.environ['EXPECTED_REPOSITORY'], os.environ['EXPECTED_COMMIT'].lower(), os.environ['EXPECTED_HANDLE']
+        if endpoint.scheme != 'https' or not endpoint.path.rstrip('/').endswith('/v1/context/responses'): raise SystemExit('Pinned Multra context endpoint is invalid')
+        if query.get('repository_full_name', '').lower() != repository.lower() or query.get('commit_sha', '').lower() != commit: raise SystemExit('Pinned repository or commit changed before Codex')
+        if query.get('context_handle') != handle or not handle: raise SystemExit('Pinned context handle is missing or changed before Codex')
+        query['code_context_required'] = 'true'
+        provider_path = endpoint.path.rstrip('/')[:-len('/responses')]
+        provider_base = urlunsplit((endpoint.scheme, endpoint.netloc, provider_path, '', ''))
+        q = lambda value: json.dumps(str(value), ensure_ascii=False)
+        pairs = ', '.join(f'{key} = {q(value)}' for key, value in sorted(query.items()))
+        lines = [f'model = {q(os.environ.get("MODEL") or "bluesky/auto")}', 'model_provider = "multra"', '', '[model_providers.multra]', 'name = "Multra.ai"', f'base_url = {q(provider_base)}', 'env_key = "BLUESKY_API_KEY"', 'wire_api = "responses"', 'requires_openai_auth = false', 'request_max_retries = 2', 'stream_max_retries = 2', f'query_params = {{ {pairs} }}', 'http_headers = { "X-Multra-Code-Context-Required" = "true" }', '']
+        Path(os.environ['CONFIG_FILE']).write_text('\n'.join(lines), encoding='utf-8')
+        PY
+        echo "config_file=$config_file" >> "$GITHUB_OUTPUT"
+
+    - name: Run Codex CLI directly through Multra
+      id: codex
+      shell: bash
+      env:
+        BLUESKY_API_KEY: ${{ inputs.multra-api-key }}
+        CONFIG_FILE: ${{ steps.config.outputs.config_file }}
+        INPUT_PROMPT: ${{ inputs.prompt }}
+        INPUT_PROMPT_FILE: ${{ inputs.prompt-file }}
+        INPUT_OUTPUT_FILE: ${{ inputs.output-file }}
+        INPUT_WORKDIR: ${{ inputs.working-directory }}
+        INPUT_OUTPUT_SCHEMA: ${{ inputs.output-schema }}
+        INPUT_OUTPUT_SCHEMA_FILE: ${{ inputs.output-schema-file }}
+        INPUT_CODEX_HOME: ${{ inputs.codex-home }}
+        MODEL: ${{ inputs.model }}
+        EFFORT: ${{ inputs.effort }}
+        SANDBOX: ${{ inputs.sandbox }}
+        EXPECTED_HEAD: ${{ steps.identity.outputs.commit_sha }}
+        EXPECTED_BRANCH: ${{ steps.identity.outputs.branch_ref }}
+      run: |
+        set -euo pipefail
+        case "$SANDBOX" in read-only|workspace-write) ;; *) echo "Verity direct Codex permits only read-only or workspace-write" >&2; exit 1 ;; esac
+        workspace="$(realpath "$GITHUB_WORKSPACE")"
+        workdir="$(realpath "${INPUT_WORKDIR:-$workspace}")"
+        case "$workdir/" in "$workspace/"*) ;; *) echo "Codex working directory escaped checkout" >&2; exit 1 ;; esac
+
+        codex_user="veritycodex"
+        if ! id "$codex_user" >/dev/null 2>&1; then sudo -n useradd --create-home --shell /bin/bash "$codex_user"; fi
+        run_dir="$(sudo -n -u "$codex_user" mktemp -d "/home/$codex_user/verity-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
+
+        # v3 runners already prepare a slot-specific codex-home-N directory so
+        # token usage, served model and provider errors can be measured after the
+        # model step. Keep that existing contract. For callers that do not pass
+        # codex-home explicitly, the v3 trace-root naming gives us the same slot
+        # deterministically; all other callers get an isolated per-invocation home.
+        codex_home=""
+        if [ -n "$INPUT_CODEX_HOME" ]; then
+          mkdir -p "$INPUT_CODEX_HOME"
+          codex_home="$(realpath "$INPUT_CODEX_HOME")"
+        elif [ -n "${CODEX_ROLLOUT_TRACE_ROOT:-}" ]; then
+          slot="${CODEX_ROLLOUT_TRACE_ROOT##*-}"
+          candidate="$RUNNER_TEMP/codex-home-$slot"
+          if [ -d "$candidate" ]; then codex_home="$(realpath "$candidate")"; fi
+        fi
+        if [ -z "$codex_home" ]; then
+          codex_home="$run_dir/home"
+          sudo -n -u "$codex_user" mkdir -p "$codex_home"
+        else
+          runner_temp="$(realpath "$RUNNER_TEMP")"
+          case "$codex_home/" in "$runner_temp/"*) ;; *) echo "codex-home must stay under RUNNER_TEMP" >&2; exit 1 ;; esac
+        fi
+        sudo -n cp "$CONFIG_FILE" "$codex_home/config.toml"
+        if [ -f .github/codex/home/models.json ] && [ ! -f "$codex_home/models.json" ]; then sudo -n cp .github/codex/home/models.json "$codex_home/models.json"; fi
+        sudo -n chown -R "$codex_user:$codex_user" "$codex_home"
+
+        if [ -n "$INPUT_PROMPT_FILE" ]; then prompt_source="$(realpath "$INPUT_PROMPT_FILE")"; elif [ -n "$INPUT_PROMPT" ]; then prompt_source="$RUNNER_TEMP/verity-direct-prompt-${RANDOM}.txt"; printf '%s' "$INPUT_PROMPT" > "$prompt_source"; else echo "Prompt is required" >&2; exit 1; fi
+        [ -f "$prompt_source" ] || { echo "Prompt file does not exist" >&2; exit 1; }
+        sudo -n cp "$prompt_source" "$run_dir/prompt.txt"
+
+        schema_file=""
+        if [ -n "$INPUT_OUTPUT_SCHEMA_FILE" ] && [ -n "$INPUT_OUTPUT_SCHEMA" ]; then echo "Use output-schema or output-schema-file, not both" >&2; exit 1; fi
+        if [ -n "$INPUT_OUTPUT_SCHEMA_FILE" ]; then sudo -n cp "$(realpath "$INPUT_OUTPUT_SCHEMA_FILE")" "$run_dir/schema.json"; schema_file="$run_dir/schema.json"; elif [ -n "$INPUT_OUTPUT_SCHEMA" ]; then printf '%s' "$INPUT_OUTPUT_SCHEMA" | sudo -n tee "$run_dir/schema.json" >/dev/null; python -m json.tool <(printf '%s' "$INPUT_OUTPUT_SCHEMA") >/dev/null; schema_file="$run_dir/schema.json"; fi
+        sudo -n chown -R "$codex_user:$codex_user" "$run_dir"
+
+        # The checkout credential belongs to trusted Verity workflow steps, not Codex.
+        git_auth_file="$RUNNER_TEMP/verity-git-auth-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RANDOM}"
+        git config --local --get-regexp '^http\..*\.extraheader$' > "$git_auth_file" 2>/dev/null || true
+        chmod 600 "$git_auth_file"
+        while read -r key; do [ -n "$key" ] && git config --local --unset-all "$key" || true; done < <(git config --local --name-only --get-regexp '^http\..*\.extraheader$' || true)
+        runner_uid="$(id -u)"; runner_gid="$(id -g)"
+        runner_home="$(dirname "$(dirname "$RUNNER_TEMP")")"
+        runner_acl_added=false
+        if [ "$SANDBOX" = "workspace-write" ]; then sudo -n chown -R "$codex_user:$codex_user" "$workspace"; fi
+        restore_git_auth() {
+          if [ -f "$git_auth_file" ]; then
+            while IFS= read -r auth_line; do
+              [ -n "$auth_line" ] || continue
+              key="${auth_line%% *}"
+              value="${auth_line#* }"
+              [ "$key" != "$value" ] && git config --local --add "$key" "$value"
+            done < "$git_auth_file"
+            rm -f "$git_auth_file"
+          fi
+        }
+        restore_workspace() {
+          if [ "${runner_acl_added:-false}" = true ]; then sudo -n setfacl -x "u:${codex_user}" "$runner_home" || true; fi
+          if [ "$SANDBOX" = "workspace-write" ]; then sudo -n chown -R "$runner_uid:$runner_gid" "$workspace" || true; fi
+          sudo -n chown -R "$runner_uid:$runner_gid" "$codex_home" || true
+          restore_git_auth
+        }
+        trap restore_workspace EXIT
+
+        # GitHub-hosted runners keep /home/runner at 0750. Give the isolated
+        # Codex user traverse-only access to that parent; do not grant listing
+        # or read access to the runner home and do not broaden checkout modes.
+        sudo -n setfacl -m "u:${codex_user}:x" "$runner_home"
+        runner_acl_added=true
+        sudo -n -u "$codex_user" test -x "$workspace" || { echo "veritycodex cannot traverse workspace" >&2; exit 1; }
+        sudo -n -u "$codex_user" test -r "$workspace/.git/HEAD" || { echo "veritycodex cannot read checkout" >&2; exit 1; }
+
+        output_tmp="$run_dir/final.md"
+        codex_bin="$(command -v codex)"
+        # Fail before buying model turns if the real sandbox cannot read/write.
+        # This runs with the same user, home and sandbox, but no API credential.
+        (
+          cd "$workdir"
+          sudo -n -u "$codex_user" -- env -i HOME="/home/$codex_user" USER="$codex_user" LOGNAME="$codex_user" PATH="$PATH" CODEX_HOME="$codex_home" \
+            "$codex_bin" sandbox --config "sandbox_mode=\"$SANDBOX\"" -- /bin/sh -eu -c 'test -r "$1/.git/HEAD"; if [ "$2" = workspace-write ]; then probe=$(mktemp "$1/.verity-sandbox-XXXXXX"); rm "$probe"; fi' sh "$workspace" "$SANDBOX"
+        )
+        echo "VERITY_CODEX_SANDBOX_READY mode=$SANDBOX"
+
+        cmd=("$codex_bin" exec --strict-config --skip-git-repo-check --cd "$workdir" --output-last-message "$output_tmp" --model "$MODEL" --sandbox "$SANDBOX")
+        if [ -n "$EFFORT" ]; then cmd+=(--config "model_reasoning_effort=\"$EFFORT\""); fi
+        if [ -n "$schema_file" ]; then cmd+=(--output-schema "$schema_file"); fi
+        cmd+=(-)
+        echo "Running Codex directly through Multra at ${EXPECTED_HEAD:0:12}; no GitHub, AWS, Verity, or provider credential is passed to Codex other than the Multra application key."
+        sudo -n cat "$run_dir/prompt.txt" | sudo -n -u "$codex_user" -- env -i HOME="/home/$codex_user" USER="$codex_user" LOGNAME="$codex_user" PATH="$PATH" CODEX_HOME="$codex_home" BLUESKY_API_KEY="$BLUESKY_API_KEY" "${cmd[@]}"
+
+        actual_head="$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')"; actual_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+        [ "$actual_head" = "$EXPECTED_HEAD" ] || { echo "Codex changed Git HEAD; Verity owns commits/checkpoints" >&2; exit 1; }
+        if [ -n "$EXPECTED_BRANCH" ] && [ "$actual_branch" != "$EXPECTED_BRANCH" ]; then echo "Codex changed the working branch; Verity owns branch state" >&2; exit 1; fi
+        restore_workspace; trap - EXIT
+        if [ -n "$INPUT_OUTPUT_FILE" ]; then sudo -n cp "$output_tmp" "$INPUT_OUTPUT_FILE"; sudo -n chown "$runner_uid:$runner_gid" "$INPUT_OUTPUT_FILE"; fi
+        delimiter="VERITY_CODEX_$(date +%s)_$RANDOM"
+        { echo "final-message<<$delimiter"; sudo -n cat "$output_tmp"; printf '\n%s\n' "$delimiter"; } >> "$GITHUB_OUTPUT"
