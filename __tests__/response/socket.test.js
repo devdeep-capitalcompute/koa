@@ -7,7 +7,8 @@ const Stream = require('stream')
 
 describe('res.socket', () => {
   it('should return the request socket object', () => {
-    const res = response()
-    assert.strictEqual(res.socket instanceof Stream, true)
+    const socket = new Stream.Duplex()
+    const res = response({ socket }, { socket })
+    assert.strictEqual(res.socket, socket)
   })
 })
