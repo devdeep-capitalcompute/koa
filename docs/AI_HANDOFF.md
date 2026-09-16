@@ -12,5 +12,55 @@ It is intended to give new developers and AI agents immediate, accurate context.
 - Monitor, command router, auto-fix, deploy, and rollout paths must stop on duplicates, no-diff attempts, same-failure fingerprints, paused projects, and attempt/budget limits.
 
 <!-- verity:auto-handoff:start -->
-_(run `python scripts/sync_repo_docs.py` to populate this section)_
+## Snapshot
+- Repository: `devdeep-capitalcompute/koa`
+- Default branch: `master`
+- Commit: `282fadd82d7f84a8179f931c911108b1afc7d683`
+- Commit date: `2026-09-16T18:33:23+05:30`
+
+## Start Here
+1. Read `AGENTS.md`.
+2. Read `.verity/config.yml`.
+3. Read `docs/REPO_CONTEXT.md`.
+4. Read `docs/use-cases.md`.
+
+## Run Commands
+Setup:
+_(none configured)_
+Tests:
+_(none configured)_
+Build:
+_(none configured)_
+Deploy:
+_(none configured)_
+
+## Key Paths
+- `AGENTS.md`
+- `.verity/config.yml`
+- `docs/REPO_CONTEXT.md`
+- `docs/AI_HANDOFF.md`
+- `docs/use-cases.md`
+- `scripts`
+- `.github/workflows`
+
+## Workflow Index
+- `codex-deploy-setup.yml`
+- `codex-deploy.yml`
+- `codex-dev-cycle.yml`
+- `codex-pr-review.yml`
+- `codex-test-generation.yml`
+- `codex-test-to-issue.yml`
+- `codex-usecase-generation.yml`
+- `node.js.yml`
+- `npm-publish.yml`
+- `verity-agent.yml`
+- `verity-auto-docs.yml`
+- `verity-builder-plan.yml`
+- `verity-command-router.yml`
+- `verity-explore.yml`
+- `verity-guardrails.yml`
+- `verity-monitor.yml`
+- `verity-pr-auto-fix.yml`
+- `verity-repo-context-builder.yml`
+- `verity-validation.yml`
 <!-- verity:auto-handoff:end -->
