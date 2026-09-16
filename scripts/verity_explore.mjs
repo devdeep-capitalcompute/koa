@@ -1,4 +1,12 @@
 #!/usr/bin/env node
+/* eslint-disable */
+// Verity ships this file into the repository under test, where it is subject to
+// whatever linter that repository runs in CI. koa runs `standard`, which found
+// 275 style violations here and failed the default branch the moment Verity
+// bootstrapped - a red build the user did not cause and could not fix without
+// editing a Verity-managed file. This is not the repository's code to hold to
+// its own style, so it opts out rather than guessing at a house style Verity
+// cannot know in advance.
 /**
  * Explore a running application and report what is broken, with evidence.
  *
