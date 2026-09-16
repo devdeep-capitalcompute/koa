@@ -72,9 +72,28 @@ jobs:
     # see DEFAULT_JOB_TOKEN_TTL_SECONDS in the Verity backend.
     timeout-minutes: 240
     # A fork's pull request must never reach a job that holds this repository's
-    # secrets. `verity-pr-auto-fix.yml` already gates on this; the same rule
-    # applies here, where the secret in question is the customer's model key.
-    if: ${{ github.event.repository.fork == false }}
+    # secrets. `verity-pr-auto-fix.yml` gates on this, and the rule was copied
+    # here — but that workflow is `pull_request`-triggered and this one is
+    # `workflow_dispatch` only, so the two are not the same question.
+    #
+    # On a `pull_request`, `github.event.repository` is the repository the PR
+    # targets and the guard keeps somebody else's fork away from these secrets.
+    # On a `workflow_dispatch` it describes the repository the run is happening
+    # in, so a repository that is *itself* a fork — one the customer owns,
+    # connected to Verity deliberately, dispatched into by Verity's own App
+    # installation — was refused. A dispatch cannot come from a stranger's
+    # fork: it needs `actions: write` on this repository, and the secrets it
+    # would reach belong to whoever owns this fork and asked for the run.
+    #
+    # The cost of the copy was silence. GitHub accepts a dispatch into a fork
+    # and then skips the job, and a skipped job runs no steps and posts no
+    # callback — so a connected, bootstrapped, scanned repository accepted
+    # "Start", reported "1 run dispatched", and left the requirement on
+    # "Starting" with nothing in existence that would ever move it.
+    #
+    # Kept rather than deleted, scoped to the event it was written for, so it
+    # still holds if a `pull_request` trigger is ever added here.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.repository.fork == false }}
     env:
       VERITY_API_BASE_URL: ${{ inputs.api_base_url }}
       VERITY_JOB_ID: ${{ inputs.job_id }}
