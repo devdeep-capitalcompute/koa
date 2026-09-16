@@ -3,15 +3,17 @@
 This file helps Verity/Codex understand how to work in this repository.
 
 ## What This Project Does
-_(Not auto-generated — the deterministic doc sync script never writes here, so this survives
-every refresh. The first Codex run in this repo fills this in from the actual codebase before
-generating anything else. If it still says this after that run, something upstream skipped
-Step 0 of use-case generation.)_
+Koa is a small Node.js HTTP middleware framework for building web applications and APIs.
+Application authors compose async or promise-based middleware; each request receives a
+context that combines normalized request inspection, content negotiation, cookies, state,
+validation, and error handling with response helpers for headers, status, redirects, body
+serialization, and streaming. The project exists to make those recurring HTTP concerns
+predictable while preserving direct access to Node's request and response objects.
 
 ## What Verity detected
 - Detected at: 2026-09-16T18:51:25+05:30
 - Repo: devdeep-capitalcompute/koa
-- Default branch: master
+- Default branch: main
 
 ## Suggested commands (review before enabling automation)
 These are written into `.verity/config.yml` (in a PR) if empty.
@@ -44,8 +46,8 @@ _(none configured)_
 
 ## Auto Documentation Snapshot
 <!-- verity:auto-doc:start -->
-- Commit: `2d6092fe69e9d903e96e125a4d02448abb58c0f9`
-- Commit date: `2026-09-16T18:51:25+05:30`
+- Commit: `eddb9874f8ba004ae98c87dfff2d59be87b21050`
+- Commit date: `2026-09-16T19:35:11Z`
 - Repository: `devdeep-capitalcompute/koa`
 - Default branch: `master`
 
