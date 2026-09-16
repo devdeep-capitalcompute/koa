@@ -1,6 +1,6 @@
 version: 2
 verity:
-  project_id: "32949d28-9786-435b-ba62-bcef0168672d"
+  project_id: "a615766c-7fe0-4738-bab8-90f4b5e750a8"
   callback_url: "https://szfu8h6spk.execute-api.us-east-1.amazonaws.com/staging/api/callbacks/github-actions"
   bootstrap_version: "v3"
   max_generated_stories: 500
